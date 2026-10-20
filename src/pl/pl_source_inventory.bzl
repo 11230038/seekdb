@@ -15,7 +15,19 @@ PL_UNITY_GROUPS = [
             "src/pl/ob_pl_package_manager.cpp",
             "src/pl/ob_pl_package_state.cpp",
             "src/pl/ob_pl_package_guard.cpp",
+        ],
+    ),
+    struct(
+        name = "pl_resolver",
+        language = "c++",
+        srcs = [
             "src/pl/ob_pl_resolver.cpp",
+        ],
+    ),
+    struct(
+        name = "pl_types",
+        language = "c++",
+        srcs = [
             "src/pl/ob_pl_router.cpp",
             "src/pl/ob_pl_stmt.cpp",
             "src/pl/ob_pl_type.cpp",

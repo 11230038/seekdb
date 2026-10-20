@@ -12,6 +12,10 @@ build --enable_platform_specific_config
 # configuration; the explicit copt also makes O1 portable to the native macOS
 # toolchain, whose fastbuild flags are not repository-owned.
 build --compilation_mode=opt
+# SLP spends most of this generated parser's compile time on location copies.
+build:linux --per_file_copt=sql_parser_mysql_mode_tab[.]c$@-fno-slp-vectorize
+build:macos --per_file_copt=sql_parser_mysql_mode_tab[.]c$@-fno-slp-vectorize
+build:windows --per_file_copt=sql_parser_mysql_mode_tab[.]c$@/clang:-fno-slp-vectorize
 # Allow developers to modify build outputs in place.
 build --experimental_writable_outputs
 # Windows generators use the installed SDK/Python utility paths.

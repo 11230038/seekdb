@@ -26,6 +26,8 @@ cd seekdb
 
 Windows 使用 `python build.py`，命令参数相同。C++ 测试目标参见[编写与运行单元测试](unittest.md)。修改 Rust 依赖时，一并提交更新后的 `rust/Cargo.lock`。
 
+Rust 的 CXX 接口头文件保存在 `rust/include/`，C++ 编译无需等待 Rust 静态库。构建会核对 Cargo 生成的头文件，接口变化后执行 `python3 rust/build.py update-headers`，将更新的头文件与接口源码一起提交。只修改 Rust 实现无需刷新头文件。
+
 ## 设置编译并发
 
 Bazel 默认按本机可用 CPU 数量设置并发。显式指定本地编译并发时，`build.py` 同时设置任务数量上限和本地 CPU 调度额度：

@@ -97,20 +97,21 @@ def _cargo_build_impl(ctx):
         groups[name + "_archive"] = depset([library])
         groups[name + "_headers"] = depset(headers)
 
+    groups["headers"] = depset(generated_headers.values())
     outputs = libraries.values() + generated_headers.values()
     directory = ctx.bin_dir.path + "/" + ctx.label.package
     work_dir = ctx.actions.declare_directory("cargo-work")
-    command = 'python "$CARGO_WORKSPACE/rust/build.py" --cargo "$CARGO" --target-dir "$CARGO_TARGET_DIR" --output "%s/cargo"' % directory
+    command = 'python "$CARGO_WORKSPACE/rust/build.py" build --cargo "$CARGO" --target-dir "$CARGO_TARGET_DIR" --output "%s/cargo"' % directory
     if platform.rust_target:
         command += " --target " + platform.rust_target
     if platform.os == "windows":
-        command = ["python", "${CARGO_WORKSPACE}/rust/build.py", "--cargo", "${CARGO}", "--target-dir", "${CARGO_TARGET_DIR}", "--output", directory + "/cargo"]
+        command = ["python", "${CARGO_WORKSPACE}/rust/build.py", "build", "--cargo", "${CARGO}", "--target-dir", "${CARGO_TARGET_DIR}", "--output", directory + "/cargo"]
     elif platform.os == "emscripten":
         command = '''wasm="$CARGO_TARGET_DIR/wasm"
 python "$CARGO_WORKSPACE/bazel/prepare_wasm_rust.py" "$("$RUSTC" --print sysroot)" "$wasm"
 export RUSTFLAGS="--sysroot=$wasm/sysroot -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals -Cpanic=abort"
 export CXXFLAGS_wasm32_unknown_emscripten="-pthread -fexceptions"
-python "$wasm/workspace/build.py" --cargo "$CARGO" --target wasm32-unknown-emscripten --target-dir "$CARGO_TARGET_DIR" --output "%s/cargo" -- --no-default-features --features sql-nio/memory-transport -Zbuild-std=std,panic_abort
+python "$wasm/workspace/build.py" build --cargo "$CARGO" --target wasm32-unknown-emscripten --target-dir "$CARGO_TARGET_DIR" --output "%s/cargo" -- --no-default-features --features sql-nio/memory-transport -Zbuild-std=std,panic_abort
 ''' % directory
     cargo_action(
         ctx,
@@ -134,8 +135,36 @@ _cargo_build = rule(
     toolchains = CARGO_TOOLCHAINS,
 )
 
+def _cargo_headers_check_impl(ctx):
+    toolchain = ctx.toolchains[CARGO_TOOLCHAIN_TYPE]
+    stamp = ctx.actions.declare_file(ctx.label.name + ".ok")
+    ctx.actions.run(
+        executable = toolchain.python,
+        arguments = [
+            ctx.file.script.path, "check-headers",
+            "--generated", ctx.bin_dir.path + "/" + ctx.label.package + "/cargo/include",
+            "--stamp", stamp.path,
+        ],
+        inputs = depset(ctx.files.srcs + [ctx.file.script], transitive = [toolchain.files]),
+        outputs = [stamp],
+        env = {"PYTHONHOME": toolchain.python_home},
+        execution_requirements = {"no-remote": "1"},
+        mnemonic = "CargoHeadersCheck",
+        progress_message = "Checking committed Rust interface headers",
+    )
+    return [DefaultInfo(files = depset([stamp]))]
+
+_cargo_headers_check = rule(
+    implementation = _cargo_headers_check_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "script": attr.label(allow_single_file = True, mandatory = True),
+    },
+    toolchains = [CARGO_TOOLCHAIN_TYPE],
+)
+
 def cargo_workspace(exports, srcs):
-    """One build action exports each crate's archive and generated headers."""
+    """Compile C++ against committed headers; verify them before linking Rust."""
     _cargo_build(
         name = "_rust_static",
         exports = json.encode(exports),
@@ -149,8 +178,23 @@ def cargo_workspace(exports, srcs):
             "//conditions:default": [],
         }),
     )
+    native.filegroup(
+        name = "generated_headers",
+        srcs = [":_rust_static"],
+        output_group = "headers",
+        visibility = ["//visibility:public"],
+    )
+    _cargo_headers_check(
+        name = "_headers_check",
+        script = "build.py",
+        srcs = ["exports.json", ":generated_headers"] + [
+            "include/" + header
+            for header in {h: True for export in exports.values() for h in export["headers"]}
+        ],
+    )
     cc_library(
         name = "_rust_runtime",
+        additional_linker_inputs = [":_headers_check"],
         linkopts = select({
             "@platforms//os:linux": ["-lpthread", "-ldl", "-lm"],
             "@platforms//os:android": ["-ldl", "-lm"],
@@ -159,18 +203,17 @@ def cargo_workspace(exports, srcs):
         }),
     )
     for name, export in exports.items():
-        for kind in ["archive", "headers"]:
-            native.filegroup(
-                name = name + ("_archive" if kind == "archive" else "_generated_headers"),
-                srcs = [":_rust_static"],
-                output_group = name + "_" + kind,
-                visibility = ["//visibility:public"] if kind == "archive" else None,
-            )
+        native.filegroup(
+            name = name + "_archive",
+            srcs = [":_rust_static"],
+            output_group = name + "_archive",
+            visibility = ["//visibility:public"],
+        )
         include_dir = export["crate"] + "/include"
         cc_library(
             name = name + "_headers",
-            hdrs = native.glob([include_dir + "/**/*.h"], allow_empty = True) + [":" + name + "_generated_headers"],
-            includes = [include_dir, "cargo/include"],
+            hdrs = native.glob([include_dir + "/**/*.h"], allow_empty = True) + ["include/" + h for h in export["headers"]],
+            includes = [include_dir, "include"],
             deps = [":" + dep + "_headers" for dep in export["deps"]],
             visibility = ["//visibility:public"],
         )

@@ -30,7 +30,7 @@ cargo_workspace(
     exports = EXPORTS,
     srcs = glob(
         ["**/*.rs", "**/*.h", "**/*.py", "**/*.toml", "**/*.yaml", "**/*.yml", "**/*.json", "*.lock"],
-        exclude = ["target/**"],
+        exclude = ["target/**", "include/**"],
         allow_empty = True,
     ),
 )

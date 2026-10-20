@@ -256,26 +256,8 @@ SHARE_UNITY_GROUPS = [
             "src/share/geo/ob_geo_func_distance_sphere.cpp",
             "src/share/geo/ob_geo_func_transform.cpp",
             "src/share/geo/ob_geo_func_box.cpp",
-        ],
-    ),
-    struct(
-        name = "ob_share_geo_buffer",
-        language = "c++",
-        srcs = [
             "src/share/geo/ob_geo_func_buffer.cpp",
-        ],
-    ),
-    struct(
-        name = "ob_share_geo_validity",
-        language = "c++",
-        srcs = [
             "src/share/geo/ob_geo_func_isvalid.cpp",
-        ],
-    ),
-    struct(
-        name = "ob_share_geo_visitors",
-        language = "c++",
-        srcs = [
             "src/share/geo/ob_geometry_cast.cpp",
             "src/share/geo/ob_wkb_to_json_visitor.cpp",
             "src/share/geo/ob_wkb_to_json_bin_visitor.cpp",
@@ -286,12 +268,6 @@ SHARE_UNITY_GROUPS = [
             "src/share/geo/ob_geo_box_clip_visitor.cpp",
             "src/share/geo/ob_geo_elevation_visitor.cpp",
             "src/share/geo/ob_geo_func_length.cpp",
-        ],
-    ),
-    struct(
-        name = "ob_share_geo_cache",
-        language = "c++",
-        srcs = [
             "src/share/geo/ob_geo_mvt_encode_visitor.cpp",
             "src/share/geo/ob_geo_mvt.cpp",
             "src/share/geo/ob_geo_affine_visitor.cpp",
@@ -503,7 +479,6 @@ SHARE_STANDALONE_SOURCES = [
     "src/share/geo/ob_geo_func_overlaps3.cpp",
     "src/share/geo/ob_geo_func_symdifference1.cpp",
     "src/share/geo/ob_geo_func_symdifference2.cpp",
-    "src/share/geo/ob_geo_func_symdifference_tree.cpp",
     "src/share/geo/ob_geo_func_symdifference3.cpp",
     "src/share/geo/ob_geo_func_touches1.cpp",
     "src/share/geo/ob_geo_func_touches2.cpp",

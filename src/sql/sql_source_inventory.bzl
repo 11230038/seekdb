@@ -1147,12 +1147,6 @@ SQL_UNITY_GROUPS = [
         srcs = [
             "src/sql/optimizer/ob_sel_estimator.cpp",
             "src/sql/optimizer/ob_select_log_plan.cpp",
-        ],
-    ),
-    struct(
-        name = "ob_sql_optimizer_location",
-        language = "c++",
-        srcs = [
             "src/sql/optimizer/ob_sharding_info.cpp",
             "src/sql/optimizer/ob_skyline_prunning.cpp",
             "src/sql/optimizer/ob_storage_estimator.cpp",

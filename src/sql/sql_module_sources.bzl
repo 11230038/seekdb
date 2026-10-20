@@ -9,7 +9,6 @@ OPTIMIZER_GROUP_NAMES = [
     "ob_sql_optimizer_cost",
     "ob_sql_optimizer_utils",
     "ob_sql_optimizer_2",
-    "ob_sql_optimizer_location",
     "ob_sql_optimizer_stat_0",
     "ob_sql_optimizer_stat_1",
 ]

@@ -112,6 +112,11 @@ pub mod ffi {
         code: i32,
         affected: u64,
     }
+    struct ParquetResult {
+        code: i32,
+        message: String,
+        json: String,
+    }
 
     unsafe extern "C++" {
         include!("callbacks.h");
@@ -134,6 +139,63 @@ pub mod ffi {
         fn status(self: &Cursor) -> i32;
         fn next(self: &mut Cursor) -> i32;
         fn row(self: &Cursor) -> &[Value];
+        fn read_parquet_json(path: &str) -> ParquetResult;
+    }
+}
+
+fn parquet_field_json(field: &parquet::record::Field) -> serde_json::Value {
+    use parquet::record::Field;
+    match field {
+        Field::Null => serde_json::Value::Null,
+        Field::Bool(v) => (*v).into(),
+        Field::Byte(v) => (*v as i64).into(),
+        Field::Short(v) => (*v as i64).into(),
+        Field::Int(v) => (*v as i64).into(),
+        Field::Long(v) => (*v).into(),
+        Field::UByte(v) => (*v as u64).into(),
+        Field::UShort(v) => (*v as u64).into(),
+        Field::UInt(v) => (*v as u64).into(),
+        Field::ULong(v) => (*v).into(),
+        Field::Float(v) => serde_json::Number::from_f64(*v as f64).map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Field::Double(v) => serde_json::Number::from_f64(*v).map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Field::Str(v) => v.clone().into(),
+        Field::Bytes(v) => String::from_utf8_lossy(v.data()).into_owned().into(),
+        Field::Date(v) => (*v as i64).into(),
+        Field::TimestampMillis(v) => (*v).into(),
+        Field::TimestampMicros(v) => (*v).into(),
+        Field::Decimal(v) => format!("{:?}", v).into(),
+        Field::Group(row) => parquet_row_json(row),
+        Field::ListInternal(list) => serde_json::Value::Array(list.elements().iter().map(parquet_field_json).collect()),
+        Field::MapInternal(map) => serde_json::Value::Array(map.entries().iter().map(|(k, v)| {
+            serde_json::json!({"key": parquet_field_json(k), "value": parquet_field_json(v)})
+        }).collect()),
+        other => format!("{:?}", other).into(),
+    }
+}
+
+fn parquet_row_json(row: &parquet::record::Row) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, field) in row.get_column_iter() {
+        object.insert(name.clone(), parquet_field_json(field));
+    }
+    serde_json::Value::Object(object)
+}
+
+pub fn read_parquet_json(path: &str) -> ffi::ParquetResult {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(path)?;
+        let reader = SerializedFileReader::new(file)?;
+        let rows = reader.get_row_iter(None)?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(parquet_row_json(&row?));
+        }
+        Ok(serde_json::to_string(&values)?)
+    })();
+    match result {
+        Ok(json) => ffi::ParquetResult { code: 0, message: String::new(), json },
+        Err(error) => ffi::ParquetResult { code: 1, message: error.to_string(), json: String::new() },
     }
 }
 

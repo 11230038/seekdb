@@ -24,6 +24,7 @@
 #include "sql/plan_cache/ob_ps_cache.h"
 #include "sql/plan_cache/ob_pcv_set.h"
 #include "sql/ob_sql_init.h"
+#include "sql/file_sql/ob_file_sql_rewriter.h"
 #include "sql/resolver/ob_resolver.h"
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "sql/resolver/cmd/ob_call_procedure_stmt.h"
@@ -158,9 +159,17 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
                         bool is_inner_sql/*true*/)
 {
   int ret = OB_SUCCESS;
+  std::string file_sql;
+  bool file_sql_rewritten = false;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
   if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(handle_ps_prepare(stmt, context, result, is_inner_sql))) {
+  } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+  } else {
+    const ObString effective_stmt = file_sql_rewritten
+                                      ? ObString(file_sql.size(), file_sql.data())
+                                      : stmt;
+    if (OB_FAIL(handle_ps_prepare(effective_stmt, context, result, is_inner_sql))) {
+    }
   }
   if (OB_FAIL(ret) && OB_SUCCESS == result.get_errcode()) {
     result.set_errcode(ret);
@@ -174,6 +183,8 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
 int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
+  std::string file_sql;
+  bool file_sql_rewritten = false;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
   ObTraceSpanGuard compile_span(&result.get_session(), TRACE_SQL_COMPILE);
   ObTruncatedString trunc_stmt(stmt);
@@ -186,8 +197,14 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
   NG_TRACE(parse_begin);
   //1 check inited
   if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
-    if (OB_EAGAIN != ret) {
+  } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+  } else {
+    const ObString effective_stmt = file_sql_rewritten
+                                      ? ObString(file_sql.size(), file_sql.data())
+                                      : stmt;
+    if (OB_FAIL(handle_text_query(effective_stmt, context, result))) {
+      if (OB_EAGAIN != ret) {
+      }
     }
   }
   //LOG_DEBUG("result errno", N_ERR_CODE, result.get_errcode(), K(ret));

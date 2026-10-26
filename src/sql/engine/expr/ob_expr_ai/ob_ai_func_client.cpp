@@ -31,6 +31,7 @@ ObAIFuncClient::ObAIFuncClient()
   abs_timeout_ts_ = 0;
   max_retry_times_ = 3;  // default retry 3 times
   timeout_sec_ = 60; // default timeout 1 minute
+  max_concurrency_ = 10;
 }
 
 void ObAIFuncClient::reset() 
@@ -77,7 +78,7 @@ int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString
 {
   int ret = OB_SUCCESS;
   int64_t remain_timeout_us = THIS_WORKER.is_timeout_ts_valid() ? THIS_WORKER.get_timeout_remain() : timeout_sec_ * 1000000;
-  if (OB_ISNULL(url) || headers.empty()) {
+  if (OB_ISNULL(url)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
@@ -182,6 +183,8 @@ int ObAIFuncClient::send_post(ObJsonObject *data, ObJsonObject *&response)
               allocator_, response_buf.string(), ObJsonInType::JSON_TREE,
               ObJsonInType::JSON_TREE, j_tree))) {
           ret = OB_ERR_INVALID_JSON_TEXT;
+        } else if (OB_ISNULL(j_tree) || j_tree->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_DATA;
         } else {
           response = static_cast<ObJsonObject *>(j_tree);
         }
@@ -212,11 +215,14 @@ int ObAIFuncClient::send_post(common::ObIAllocator &allocator,
 int ObAIFuncClient::send_post_batch(ObArray<ObJsonObject *> &data_array, ObArray<ObJsonObject *> &responses) 
 {
   int ret = OB_SUCCESS;
-  if (data_array.empty() || OB_ISNULL(url_) || OB_ISNULL(header_list_)) {
+  if (data_array.empty() || OB_ISNULL(url_)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(curlm_)) {
     if (OB_ISNULL(curlm_ = curl_multi_init())) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (CURLM_OK != curl_multi_setopt(curlm_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                                             static_cast<long>(max_concurrency_))) {
+      ret = OB_CURL_ERROR;
     }
   } 
   if (OB_SUCC(ret)) {
@@ -299,11 +305,14 @@ int ObAIFuncClient::send_post_batch(common::ObIAllocator &allocator,
 int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array) 
 {
   int ret = OB_SUCCESS;
-  if (data_array.empty() || OB_ISNULL(url_) || OB_ISNULL(header_list_)) {
+  if (data_array.empty() || OB_ISNULL(url_)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(curlm_)) {
     if (OB_ISNULL(curlm_ = curl_multi_init())) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (CURLM_OK != curl_multi_setopt(curlm_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                                             static_cast<long>(max_concurrency_))) {
+      ret = OB_CURL_ERROR;
     }
   } 
   if (OB_SUCC(ret)) {
@@ -358,7 +367,7 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
         if (res == CURLE_OK) {
           long response_code;
           curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
-          if (response_code != 200) {
+          if (response_code / 100 != 2) {
             ret = OB_CURL_ERROR;
           }
         }
@@ -378,6 +387,8 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
               allocator_, response_str, ObJsonInType::JSON_TREE,
               ObJsonInType::JSON_TREE, j_tree))) {
         ret = OB_ERR_INVALID_JSON_TEXT;
+      } else if (OB_ISNULL(j_tree) || j_tree->json_type() != ObJsonNodeType::J_OBJECT) {
+        ret = OB_INVALID_DATA;
       } else if (OB_FAIL(responses.push_back(static_cast<ObJsonObject *>(j_tree)))) {
       }
     }

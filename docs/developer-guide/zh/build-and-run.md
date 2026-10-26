@@ -26,7 +26,7 @@ cd seekdb
 
 Windows 使用 `python build.py`，命令参数相同。C++ 测试目标参见[编写与运行单元测试](unittest.md)。修改 Rust 依赖时，一并提交更新后的 `rust/Cargo.lock`。
 
-Rust 的 CXX 接口头文件保存在 `rust/include/`，C++ 编译无需等待 Rust 静态库。构建会核对 Cargo 生成的头文件，接口变化后执行 `python3 rust/build.py update-headers`，将更新的头文件与接口源码一起提交。只修改 Rust 实现无需刷新头文件。
+Rust 的 CXX 接口由 Bazel 自动生成，头文件路径为接口源码路径加 `.h`，例如 `#include "rust/local/src/bridge.rs.h"`。C++ 编译只等待所需头文件，不等待 Rust 静态库。只想查看接口时执行 `./build.py build //rust:generated_headers`，文件位于 `build/bin/rust/`；该目标不编译 Rust 业务库。配置 YAML 由 Python 生成配置源码和 `config_checkers.h`，生成文件无需入库。
 
 ## 设置编译并发
 

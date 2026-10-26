@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "observer/ai_service/ob_ai_service_proxy.h"
 #include "share/ob_share_util.h"
 #include "share/ob_dml_sql_splicer.h"

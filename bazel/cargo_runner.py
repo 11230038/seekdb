@@ -59,7 +59,7 @@ environment.update({
     "HOME": str(home), "USERPROFILE": str(home),
     "CARGO_HOME": str(cargo_home), "CARGO_NET_OFFLINE": "true",
     "CARGO": str(cargo), "RUSTC": str(rustc),
-    "CARGO_WORKSPACE": str(workspace),
+    "CARGO_WORKSPACE": str(workspace), "CARGO_VENDOR": str(vendor),
     "CARGO_TARGET_DIR": str(work / "target"),
 })
 if os.name != "nt":
@@ -86,7 +86,7 @@ if target:
         environment["CARGO_TARGET_" + target.upper() + "_LINKER"] = str(cc)
 command = args.command[1:] if args.command[:1] == ["--"] else args.command
 for index, argument in enumerate(command):
-    for key in ("CARGO_WORKSPACE", "CARGO_TARGET_DIR", "CARGO"):
+    for key in ("CARGO_WORKSPACE", "CARGO_TARGET_DIR", "CARGO", "CARGO_VENDOR"):
         argument = argument.replace("${" + key + "}", environment[key])
     command[index] = argument
 status = subprocess.call(command, env=environment)

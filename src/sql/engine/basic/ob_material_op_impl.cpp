@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_material_op_impl.h"
 
 namespace oceanbase

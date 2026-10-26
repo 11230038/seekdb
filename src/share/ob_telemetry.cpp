@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "lib/utility/utility.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/string/ob_sql_string.h"

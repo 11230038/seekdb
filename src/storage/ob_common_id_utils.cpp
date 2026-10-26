@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_common_id_utils.h"
 #include "common/ob_timeout_ctx.h"
 #include "share/ob_share_util.h"

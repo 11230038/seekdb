@@ -15,7 +15,7 @@
  */
 
 #define USING_LOG_PREFIX TRANS
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_trans_ctx.h"
 #include "ob_trans_service.h"
 

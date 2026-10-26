@@ -15,7 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/optimizer/ob_explain_note.h"

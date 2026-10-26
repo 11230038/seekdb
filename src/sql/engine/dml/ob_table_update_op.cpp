@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_table_update_op.h"
 #include "sql/engine/dml/ob_dml_service.h"
 

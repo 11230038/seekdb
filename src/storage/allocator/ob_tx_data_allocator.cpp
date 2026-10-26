@@ -17,7 +17,7 @@
 #define USING_LOG_PREFIX SHARE
 
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_tx_data_allocator.h"
 #include "lib/alloc/alloc_func.h"
 #include "share/rc/ob_server_runtime.h"

@@ -15,7 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SERVER
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "query/protocol/ob_mysql_packet_sender.h"
 #include "nio.h"
 #include "observer/mysql/ob_mysql_result_set.h"

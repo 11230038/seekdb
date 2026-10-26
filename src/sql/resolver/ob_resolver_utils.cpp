@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "share/config/ob_config_helper.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 

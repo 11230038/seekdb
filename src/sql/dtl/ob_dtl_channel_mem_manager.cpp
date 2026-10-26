@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_DTL
 
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "ob_dtl_channel_mem_manager.h"
 
 using namespace oceanbase::common;

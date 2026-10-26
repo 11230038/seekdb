@@ -1,4 +1,4 @@
-#include "config_bridge.h"
+#include "rust/config/generated_config.rs.h"
 #include "share/ob_ex_rpc.h"
 /*
  * Copyright (c) 2025 OceanBase.

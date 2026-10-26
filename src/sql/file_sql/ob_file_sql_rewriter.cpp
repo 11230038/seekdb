@@ -675,12 +675,12 @@ std::string quote_sql_string(const std::string &value)
 
 std::string json_path(const std::string &name)
 {
-  std::string path = "$.\\\"";
+  std::string path = "$.\"";
   for (const char c : name) {
     if (c == '\\' || c == '"') { path.push_back('\\'); }
     path.push_back(c);
   }
-  path += "\\\"";
+  path += "\"";
   return path;
 }
 

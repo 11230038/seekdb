@@ -46,7 +46,7 @@ int ObMPStmtReset::process()
     LOG_WARN("fail get process extra info", K(ret));
   } else if (FALSE_IT(need_disconnect = false)) {
   } else if (OB_FAIL(update_transmission_checksum_flag(*session))) {
-    LOG_WARN("update transmisson checksum flag failed", K(ret));
+    LOG_WARN("update transmission checksum flag failed", K(ret));
   } else {
     // ...
   }

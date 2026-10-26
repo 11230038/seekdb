@@ -393,7 +393,7 @@ class ObBar
 const int ObBar::CONST_V = 1;
 ```
 
-在C++11之前，C++98标准只允许 intergral 类型 `static const` 变量在类声明中包含定义进行初始化。在C++11中，引入了constexpr，用 `static constexpr` 成员变量（包括double等类型）也可以在声明中进行初始化。这种变量在编译后也不会产生静态区存储。
+在C++11之前，C++98标准只允许 integral 类型 `static const` 变量在类声明中包含定义进行初始化。在C++11中，引入了constexpr，用 `static constexpr` 成员变量（包括double等类型）也可以在声明中进行初始化。这种变量在编译后也不会产生静态区存储。
 
 ```cpp
 constexpr double earth_gravitational_acceleration = 9.8;

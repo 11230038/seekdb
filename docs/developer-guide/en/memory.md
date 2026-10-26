@@ -132,7 +132,7 @@ Compared with reset, it is more lightweight. Try not to release some expensive r
 
 **init/destroy**
 
-There are two other common interfaces in seekdb: `init` and `destroy`. `init` is used to initizalize object and `destory` to release resources. Only do some very lightweight initialization work in the constructor, such as initializing the pointer to `nullptr`.
+There are two other common interfaces in seekdb: `init` and `destroy`. `init` is used to initialize an object and `destroy` to release resources. Only do some very lightweight initialization work in the constructor, such as initializing the pointer to `nullptr`.
 
 ## SMART_VAR/HEAP_VAR
 

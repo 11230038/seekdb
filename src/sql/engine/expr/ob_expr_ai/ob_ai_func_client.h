@@ -34,6 +34,7 @@ public:
   void clean_up();
   void reset();
   void set_timeout_sec(int64_t timeout_sec) { timeout_sec_ = timeout_sec; }
+  void set_max_concurrency(int64_t max_concurrency) { max_concurrency_ = max_concurrency; }
   // ai function interface
   virtual int send_post(common::ObIAllocator &allocator, 
                         const ObString &url,
@@ -71,6 +72,7 @@ private:
   int64_t max_retry_times_;
   int64_t abs_timeout_ts_;
   int64_t timeout_sec_;
+  int64_t max_concurrency_;
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncClient);
 };
 

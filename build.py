@@ -221,7 +221,7 @@ def main(arguments: List[str]) -> int:
     # here. Bazel flags on the command line override these defaults.
     status_command = (
         "python bazel/build_metadata.py status"
-        if os.name == "nt" else shlex.join([
+        if os.name == "nt" else " ".join(shlex.quote(argument) for argument in [
             sys.executable,
             str(root / "bazel/build_metadata.py"),
             "status",

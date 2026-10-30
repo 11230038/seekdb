@@ -28,6 +28,7 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/engine/expr/ob_json_param_type.h"
 #include "sql/engine/expr/ob_expr_json_utils.h"
+#include <string>
 
 namespace oceanbase
 {
@@ -43,6 +44,7 @@ class ObRegCol;
 class ScanNode;
 class UnionNode;
 class ObMultiModeTableNode;
+class FileSqlCursor;
 
 enum table_type : int8_t {
   OB_INVALID_TABLE = 0,
@@ -194,6 +196,8 @@ public:
       is_inited_(false),
       is_evaled_(false),
       root_(nullptr),
+      file_sql_cursor_(nullptr),
+      file_sql_batch_(),
       input_(nullptr),
       j_null_(),
       j_arr_(allocator_),
@@ -215,6 +219,10 @@ public:
   ObJsonObject* get_js_object() { return &j_obj_; }
   void* get_root_param() { return input_; }
   JoinNode* get_root_entry() { return root_; }
+  int prepare_file_sql_batch(const common::ObString &candidate,
+                             common::ObString &batch,
+                             bool &handled);
+  bool has_file_sql_cursor() const { return file_sql_cursor_ != nullptr; }
   TO_STRING_KV(K_(is_inited),
                K_(col_count));
 
@@ -237,6 +245,8 @@ private:
   bool is_evaled_;
   JoinNode* root_;  // mul mode table
   JtScanCtx jt_ctx_;
+  FileSqlCursor *file_sql_cursor_;
+  std::string file_sql_batch_;
 
 public:
   void *input_;   // mul mode table

@@ -289,7 +289,7 @@ END_P SET_VAR DELIMITER
         FOUND FORK FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FROZEN FILE_ID FILTER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
-        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
+        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GLOB GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
         HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
@@ -336,7 +336,7 @@ END_P SET_VAR DELIMITER
         REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
-        RANK READ_ONLY RECOVERY REJECT ROLE
+        RANK READ_ONLY READ_CSV READ_JSON READ_NDJSON READ_PARQUET RECOVERY REJECT ROLE
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt update_stmt delete_stmt copy_stmt copy_source opt_copy_options copy_option_list copy_option copy_option_name
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -405,7 +405,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_limit_clause limit_expr opt_lock_type opt_for_update opt_for_update_wait opt_lock_in_share_mode
 %type <node> sort_list sort_key opt_asc_desc sort_list_for_group_by sort_key_for_group_by opt_asc_desc_for_group_by sort_list_opt_null sort_key_opt_null opt_asc_desc_null
 %type <node> opt_query_expression_option_list query_expression_option_list query_expression_option opt_distinct opt_distinct_or_all opt_separator projection
-%type <node> from_list table_references table_reference table_factor normal_relation_factor dot_relation_factor relation_factor
+%type <node> from_list table_references table_reference table_factor normal_relation_factor dot_relation_factor relation_factor file_table_expr file_function_name
 %type <node> relation_factor_in_hint relation_factor_in_hint_list relation_factor_in_pq_hint opt_relation_factor_in_hint_list relation_factor_in_use_join_hint_list
 %type <node> relation_factor_in_leading_hint_list joined_table tbl_name table_subquery table_subquery_alias
 %type <node> relation_factor_with_star relation_with_star_list opt_with_star
@@ -556,6 +556,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -663,6 +664,73 @@ stmt:
     }
   }
   ;
+
+copy_stmt:
+COPY copy_source TO STRING_VALUE opt_copy_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_INTO_OUTFILE,
+                           3, $4, $5, $2);
+}
+;
+
+copy_source:
+'(' select_no_parens ')'
+{
+  $$ = $2;
+}
+| relation_factor
+{
+  $$ = $1;
+}
+;
+
+opt_copy_options:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  merge_nodes($$, result, T_EXPR_LIST, $2);
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+copy_option_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_SYS, 1, $1);
+}
+| copy_option_name '=' expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_SYS, 2, $1, $3);
+}
+| copy_option_name expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_SYS, 2, $1, $2);
+}
+;
+
+copy_option_name:
+relation_name
+{
+  $$ = $1;
+}
+| DELIMITER
+{
+  make_name_node($$, result->malloc_pool_, "delimiter");
+}
+;
 
 /*****************************************************************************
 *
@@ -10835,6 +10903,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -10849,6 +10921,68 @@ tbl_name
   $$ = $1;
 }
 ;
+
+file_table_expr:
+file_function_name '(' opt_expr_as_list ')'
+{
+  ParseNode *params = NULL;
+  ParseNode *function = NULL;
+  if ($3 != NULL) {
+    merge_nodes(params, result, T_EXPR_LIST, $3);
+  }
+  malloc_non_terminal_node(function, result->malloc_pool_, T_FUN_SYS, 2, $1, params);
+  /* Normal execution rewrites file functions before resolver entry.  Keeping a
+     dedicated parse shape lets parser clients validate the public syntax. */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION,
+                           5, function, NULL, NULL, NULL, NULL);
+}
+| file_function_name '(' opt_expr_as_list ')' relation_name
+{
+  ParseNode *params = NULL;
+  ParseNode *function = NULL;
+  if ($3 != NULL) {
+    merge_nodes(params, result, T_EXPR_LIST, $3);
+  }
+  malloc_non_terminal_node(function, result->malloc_pool_, T_FUN_SYS, 2, $1, params);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION,
+                           5, function, NULL, NULL, NULL, $5);
+}
+| file_function_name '(' opt_expr_as_list ')' AS relation_name
+{
+  ParseNode *params = NULL;
+  ParseNode *function = NULL;
+  if ($3 != NULL) {
+    merge_nodes(params, result, T_EXPR_LIST, $3);
+  }
+  malloc_non_terminal_node(function, result->malloc_pool_, T_FUN_SYS, 2, $1, params);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION,
+                           5, function, NULL, NULL, NULL, $6);
+}
+;
+
+file_function_name:
+READ_CSV
+{
+  make_name_node($$, result->malloc_pool_, "read_csv");
+}
+| READ_JSON
+{
+  make_name_node($$, result->malloc_pool_, "read_json");
+}
+| READ_NDJSON
+{
+  make_name_node($$, result->malloc_pool_, "read_ndjson");
+}
+| READ_PARQUET
+{
+  make_name_node($$, result->malloc_pool_, "read_parquet");
+}
+| GLOB
+{
+  make_name_node($$, result->malloc_pool_, "glob");
+}
+;
+
 
 tbl_name:
 relation_factor %prec LOWER_PARENS

@@ -289,6 +289,8 @@ SQL_INTERFACE_CLOSURE_HEADERS = [
     "executor/ob_executor.h",
     "executor/ob_maintain_dependency_info_task.h",
     "executor/ob_sql_executor_ctx.h",
+    "file_sql/file_sql_access.h",
+    "file_sql/ob_file_sql_rewriter.h",
     "hybrid_search/ob_query_parse.h",
     "hybrid_search/ob_query_request.h",
     "hybrid_search/ob_request_base.h",

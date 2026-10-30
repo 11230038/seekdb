@@ -164,6 +164,7 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+    result.get_exec_context().set_need_disconnect(false);
   } else {
     const ObString effective_stmt = file_sql_rewritten
                                       ? ObString(file_sql.size(), file_sql.data())
@@ -198,6 +199,7 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
   //1 check inited
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+    result.get_exec_context().set_need_disconnect(false);
   } else {
     const ObString effective_stmt = file_sql_rewritten
                                       ? ObString(file_sql.size(), file_sql.data())

@@ -1,6 +1,18 @@
 .gitattributes export-ignore
 .gitignore export-ignore
 
+# Parser generators run under Bash even when CMake is launched from a Windows
+# checkout. Keep their interpreter and commands free of CRLF bytes.
+src/sql/parser/gen_parser.sh text eol=lf
+src/sql/parser/gen_type_name.sh text eol=lf
+src/pl/parser/gen_parser.sh text eol=lf
+
+# Local deployment entry points are also invoked from Linux and WSL.
+tools/deploy/*.sh text eol=lf
+
+# mysqltest compares result files byte-for-byte on Linux.
+tools/deploy/mysql_test/**/*.result text eol=lf
+
 # All OceanBase code is auto-formatted using clang-format.
 *.c filter=codeformat
 *.cc filter=codeformat

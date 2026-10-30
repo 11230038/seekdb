@@ -5460,6 +5460,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_select_exprs().count()))) {
   } else {
     ObString var;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
@@ -5475,6 +5476,17 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(generate_rt_expr(*select_expr, rt_expr))) {
       } else if (OB_FAIL(spec.select_exprs_.push_back(rt_expr))) {
+      } else {
+        ObString alias = select_expr->get_alias_column_name().empty()
+                           ? select_expr->get_expr_name()
+                           : select_expr->get_alias_column_name();
+        if (alias.empty() && select_expr->is_column_ref_expr()) {
+          alias = static_cast<const ObColumnRefRawExpr *>(select_expr)->get_column_name();
+        }
+        ObString copied_alias;
+        if (OB_FAIL(ob_write_string(alloc, alias, copied_alias))) {
+        } else if (OB_FAIL(spec.column_names_.push_back(copied_alias))) {
+        }
       }
     }
     if (OB_SUCC(ret)) {

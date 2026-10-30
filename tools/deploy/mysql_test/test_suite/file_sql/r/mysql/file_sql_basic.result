@@ -14,7 +14,16 @@ id	name	score	active	day	note
 1	Alice	98.5	1	NULL	NULL
 2	Bob	NULL	0	2026-08-02	NULL
 3	Chen	90	1	NULL	ok
-# inferred CSV schema using DuckDB DESCRIBE syntax
+# Native seekdb INNER/LEFT JOIN, including a cross-format join
+id	name	note
+1	Alice	NULL
+2	Bob	NULL
+3	Chen	ok
+id	name	right_name
+1	Alice	Bob
+2	Bob	Chen
+3	Chen	NULL
+# inferred CSV schema through DESCRIBE SELECT
 column_name	column_type	null	key	default	extra
 id	BIGINT	NO	NULL	NULL	NULL
 name	VARCHAR	NO	NULL	NULL	NULL
@@ -27,7 +36,7 @@ id__2	BIGINT	NO	NULL	NULL	NULL
 # Parquet scan and aggregate push through projected columns
 row_count	min_c1	max_c1	sum_c1
 7	0	6	21
-# DuckDB glob returns one file column
+# glob returns one file column
 file
 basic.csv
 basic.jsonl
@@ -38,3 +47,6 @@ id	name	score
 1	Alice	98.5
 2	Bob	87
 3	Chen	90.25
+# COPY CSV quoting, delimiter, escape and NULL text options
+a,b	n	text_value
+1	NULL	say "hi"

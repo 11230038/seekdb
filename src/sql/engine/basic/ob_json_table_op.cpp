@@ -16,11 +16,16 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_json_table_op.h"
+#include "sql/file_sql/file_sql_access.h"
 #include "sql/engine/expr/ob_expr_multi_mode_func_helper.h"
 #include "sql/engine/expr/ob_expr_json_value.h"
 #include "sql/engine/expr/ob_expr_json_query.h"
 #include "common/xml/ob_binary_aggregate.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "sql/session/ob_basic_session_info.h"
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 
 namespace oceanbase
 {
@@ -436,10 +441,14 @@ int ObJsonTableOp::generate_table_exec_tree(ObIAllocator* allocator,
   }
   
   for (int i = 0; OB_SUCC(ret) && i < reg_count; ++i) {
-    ObRegCol* reg_node = nullptr;
-    if (OB_FAIL(construct_table_func_reg_node(allocator, orig_col.regular_cols_.at(i)->col_base_info_, reg_node))) {
-    } else {
-      if (OB_FAIL(scan_col->add_reg_column_node(reg_node))) {
+    const ObJtColInfo &column = orig_col.regular_cols_.at(i)->col_base_info_;
+    // The code generator assigns an output index only to referenced columns.
+    // Do not build executable nodes for pruned JSON_TABLE columns: besides
+    // avoiding needless extraction, their -1 output index is not addressable.
+    if (column.output_column_idx_ >= 0) {
+      ObRegCol* reg_node = nullptr;
+      if (OB_FAIL(construct_table_func_reg_node(allocator, column, reg_node))) {
+      } else if (OB_FAIL(scan_col->add_reg_column_node(reg_node))) {
       }
     } 
   }
@@ -602,8 +611,13 @@ int ObJsonTableOp::inner_rescan()
   } else {
     jt_ctx_.row_alloc_.reuse();
   }
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(reset_variable())) {
+  if (OB_SUCC(ret) && OB_NOT_NULL(file_sql_cursor_)) {
+    std::string error;
+    if (OB_FAIL(file_sql_cursor_->rewind(error))) {
+      LOG_WARN("failed to rewind file SQL cursor", K(ret), "error", error.c_str());
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(reset_variable())) {
   }
   return ret;
 }
@@ -697,6 +711,11 @@ int ObJsonTableOp::inner_close()
   if (OB_NOT_NULL(jt_ctx_.table_func_) && OB_NOT_NULL(jt_ctx_.op_exec_alloc_)) {
     jt_ctx_.op_exec_alloc_->free(jt_ctx_.table_func_);
   }
+  if (OB_NOT_NULL(file_sql_cursor_)) {
+    delete file_sql_cursor_;
+    file_sql_cursor_ = nullptr;
+  }
+  file_sql_batch_.clear();
   return ret;
 }
 
@@ -722,6 +741,11 @@ void ScanNode::reset_reg_columns(JtScanCtx* ctx)
 
 void ObJsonTableOp::destroy()
 {
+  if (OB_NOT_NULL(file_sql_cursor_)) {
+    delete file_sql_cursor_;
+    file_sql_cursor_ = nullptr;
+  }
+  file_sql_batch_.clear();
   ObOperator::destroy();
 }
 
@@ -1405,25 +1429,124 @@ int ObJsonTableOp::inner_get_next_row()
   if (!(jt_ctx_.is_json_table_func()
         || jt_ctx_.is_unnest_table_func())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (is_evaled_) {
-    clear_evaluated_flag();
-    if (OB_FAIL(root_->get_next_row(input_, &jt_ctx_, is_root_null))) {
-      if (ret != OB_ITER_END) {
-      }
-    }
   } else {
-    clear_evaluated_flag();
-    if (OB_FAIL(jt_ctx_.table_func_->eval_input(*this, jt_ctx_, *jt_ctx_.eval_ctx_))) {  // get input value
-      if (ret != OB_ITER_END) {
+    bool advance_batch = false;
+    do {
+      advance_batch = false;
+      clear_evaluated_flag();
+      if (!is_evaled_) {
+        if (OB_FAIL(jt_ctx_.table_func_->eval_input(*this, jt_ctx_, *jt_ctx_.eval_ctx_))) {
+        } else {
+          is_evaled_ = true;
+        }
       }
-    } else if (OB_FAIL(root_->get_next_row(input_, &jt_ctx_, is_root_null))) {
-      if (ret != OB_ITER_END) {
+      if (OB_SUCC(ret) && OB_FAIL(root_->get_next_row(input_, &jt_ctx_, is_root_null)) &&
+          ret == OB_ITER_END && has_file_sql_cursor()) {
+        ret = OB_SUCCESS;
+        if (OB_FAIL(root_->reset(&jt_ctx_))) {
+        } else {
+          jt_ctx_.row_alloc_.reuse();
+          input_ = nullptr;
+          is_evaled_ = false;
+          advance_batch = true;
+        }
       }
-    } else {
-      is_evaled_ = true;
-    }
+    } while (OB_SUCC(ret) && advance_batch);
   }
 
+  return ret;
+}
+
+int ObJsonTableOp::prepare_file_sql_batch(const common::ObString &candidate,
+                                          common::ObString &batch,
+                                          bool &handled)
+{
+  int ret = OB_SUCCESS;
+  handled = file_sql_cursor_ != nullptr;
+  static const char FILE_SQL_PREFIX[] = "{\"__seekdb_file_sql_v1\":true";
+  if (!handled && candidate.length() >= static_cast<int64_t>(sizeof(FILE_SQL_PREFIX) - 1) &&
+      0 == MEMCMP(candidate.ptr(), FILE_SQL_PREFIX, sizeof(FILE_SQL_PREFIX) - 1)) {
+    handled = true;
+    rapidjson::Document descriptor;
+    descriptor.Parse(candidate.ptr(), candidate.length());
+    const ObBasicSessionInfo *session = get_exec_ctx().get_my_session();
+    if (descriptor.HasParseError() || !descriptor.IsObject() ||
+        !descriptor.HasMember("path") || !descriptor["path"].IsString()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_ISNULL(session)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      int64_t enabled = 0;
+      const std::string path(descriptor["path"].GetString(), descriptor["path"].GetStringLength());
+      std::string scan_descriptor(candidate.ptr(), candidate.length());
+      std::string error;
+      if (descriptor.HasMember("columns") && descriptor["columns"].IsArray() &&
+          !descriptor["columns"].Empty()) {
+        rapidjson::Value projection(rapidjson::kArrayType);
+        const ObJsonTableSpec *spec_ptr = static_cast<const ObJsonTableSpec *>(&spec_);
+        for (const auto &column : descriptor["columns"].GetArray()) {
+          if (!column.IsObject() || !column.HasMember("name") || !column["name"].IsString()) {
+            ret = OB_INVALID_ARGUMENT;
+            break;
+          }
+          const char *name = column["name"].GetString();
+          const int64_t name_length = column["name"].GetStringLength();
+          bool referenced = false;
+          for (int64_t i = 0; !referenced && i < spec_ptr->cols_def_.count(); ++i) {
+            const ObJtColInfo *info = spec_ptr->cols_def_.at(i);
+            referenced = OB_NOT_NULL(info) && info->output_column_idx_ >= 0 &&
+                         info->col_name_.length() == name_length &&
+                         0 == MEMCMP(info->col_name_.ptr(), name, name_length);
+          }
+          if (referenced) {
+            rapidjson::Value projected_name;
+            projected_name.SetString(name, static_cast<rapidjson::SizeType>(name_length),
+                                     descriptor.GetAllocator());
+            projection.PushBack(projected_name, descriptor.GetAllocator());
+          }
+        }
+        // COUNT(*) has no referenced output column, but one physical column is
+        // still needed to drive the Parquet row iterator and preserve row count.
+        if (OB_SUCC(ret) && projection.Empty()) {
+          const auto &first = descriptor["columns"][0]["name"];
+          rapidjson::Value projected_name;
+          projected_name.SetString(first.GetString(), first.GetStringLength(),
+                                   descriptor.GetAllocator());
+          projection.PushBack(projected_name, descriptor.GetAllocator());
+        }
+        if (OB_SUCC(ret) && projection.Size() < descriptor["columns"].Size()) {
+          descriptor.AddMember("projection", projection, descriptor.GetAllocator());
+          rapidjson::StringBuffer buffer;
+          rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+          descriptor.Accept(writer);
+          scan_descriptor.assign(buffer.GetString(), buffer.GetSize());
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(session->get_sys_variable_by_name(
+                                      common::ObString("enable_file_sql"), enabled))) {
+      } else if (OB_SUCC(ret) && enabled == 0) {
+        ret = OB_NOT_SUPPORTED;
+      } else if (OB_SUCC(ret) && OB_FAIL(check_file_sql_path(*session, path, false))) {
+      } else if (OB_SUCC(ret) && OB_FAIL(open_file_sql_cursor(
+                   scan_descriptor, file_sql_cursor_, error))) {
+        LOG_WARN("failed to open file SQL cursor", K(ret), "error", error.c_str());
+      }
+    }
+  }
+  if (OB_SUCC(ret) && handled) {
+    bool end = false;
+    std::string error;
+    file_sql_batch_.clear();
+    if (OB_ISNULL(file_sql_cursor_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(file_sql_cursor_->next(256, file_sql_batch_, end, error))) {
+      LOG_WARN("failed to fetch file SQL batch", K(ret), "error", error.c_str());
+    } else if (end) {
+      ret = OB_ITER_END;
+    } else {
+      batch.assign_ptr(file_sql_batch_.data(), file_sql_batch_.size());
+    }
+  }
   return ret;
 }
 
@@ -2058,6 +2181,15 @@ int JsonTableFunc::eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval
       ret = OB_ERR_INPUT_JSON_TABLE;
     } else if (is_null) {
       ret = OB_ITER_END;
+    } else {
+      bool is_file_sql = false;
+      ObString file_batch;
+      if (OB_FAIL(jt.prepare_file_sql_batch(j_str, file_batch, is_file_sql))) {
+      } else if (is_file_sql) {
+        j_str = file_batch;
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (ob_is_string_type(doc_type)
                 && (doc_cs_type != CS_TYPE_BINARY)
                 && (ObCharset::charset_type_by_coll(doc_cs_type) != CHARSET_UTF8MB4)) {

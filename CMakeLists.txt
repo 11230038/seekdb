@@ -228,6 +228,33 @@ elseif(UNIX)
   set(STDC_SHARED_LIB_SYMLINK "${DEVTOOLS_DIR}/lib64/libstdc++.so")
 endif()
 
+# Some dependency layouts contain zero-byte ar/ranlib placeholders. CMake may
+# select them from the compiler's --gcc-toolchain path even though they cannot
+# execute, which then breaks both native archives and Cargo build scripts.
+if(UNIX AND NOT APPLE)
+  foreach(SEEKDB_ARCHIVE_TOOL AR RANLIB)
+    set(SEEKDB_ARCHIVE_TOOL_PATH "${CMAKE_${SEEKDB_ARCHIVE_TOOL}}")
+    set(SEEKDB_ARCHIVE_TOOL_USABLE FALSE)
+    if(EXISTS "${SEEKDB_ARCHIVE_TOOL_PATH}")
+      file(SIZE "${SEEKDB_ARCHIVE_TOOL_PATH}" SEEKDB_ARCHIVE_TOOL_SIZE)
+      if(SEEKDB_ARCHIVE_TOOL_SIZE GREATER 0)
+        set(SEEKDB_ARCHIVE_TOOL_USABLE TRUE)
+      endif()
+    endif()
+    if(NOT SEEKDB_ARCHIVE_TOOL_USABLE)
+      string(TOLOWER "${SEEKDB_ARCHIVE_TOOL}" SEEKDB_ARCHIVE_TOOL_NAME)
+      find_program(SEEKDB_SYSTEM_${SEEKDB_ARCHIVE_TOOL}
+        NAMES "${SEEKDB_ARCHIVE_TOOL_NAME}"
+        PATHS /usr/bin /bin
+        NO_DEFAULT_PATH REQUIRED)
+      set(CMAKE_${SEEKDB_ARCHIVE_TOOL}
+        "${SEEKDB_SYSTEM_${SEEKDB_ARCHIVE_TOOL}}"
+        CACHE FILEPATH "Archive tool" FORCE)
+      message(STATUS "Using system ${SEEKDB_ARCHIVE_TOOL_NAME}: ${CMAKE_${SEEKDB_ARCHIVE_TOOL}}")
+    endif()
+  endforeach()
+endif()
+
 add_subdirectory(deps/external)
 if(TARGET seekdb_jemalloc)
   set(OB_HAVE_BUNDLED_JEMALLOC TRUE)

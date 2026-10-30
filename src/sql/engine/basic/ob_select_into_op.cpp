@@ -35,7 +35,7 @@ namespace sql
 {
 
 OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
-OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
+OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, header_names_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
     external_properties_);
@@ -200,6 +200,12 @@ int ObSelectIntoOp::inner_get_next_row()
       && T_INTO_VARIABLES != into_type
       && OB_FAIL(create_the_only_data_writer(data_writer))) {
   }
+  if (OB_SUCC(ret) && need_write_header()) {
+    if (OB_ISNULL(data_writer)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(write_header(*static_cast<ObCsvFileWriter *>(data_writer)))) {
+    }
+  }
   while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
     clear_evaluated_flag();
     if (OB_FAIL(child_->get_next_row())) {
@@ -253,6 +259,8 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
     if (OB_FAIL(create_the_only_data_writer(data_writer))) {
     } else if (OB_ISNULL(data_writer)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (need_write_header()
+               && OB_FAIL(write_header(*static_cast<ObCsvFileWriter *>(data_writer)))) {
     }
   }
 
@@ -1040,6 +1048,54 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
 bool ObSelectIntoOp::file_need_split(int64_t file_size)
 {
   return !MY_SPEC.is_single_ && file_size > MY_SPEC.max_file_size_;
+}
+
+bool ObSelectIntoOp::need_write_header() const
+{
+  return !header_written_
+      && T_INTO_OUTFILE == MY_SPEC.into_type_
+      && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
+      && external_properties_.csv_format_.parse_header_
+      && !MY_SPEC.header_names_.empty()
+      && MY_SPEC.header_names_.count() == MY_SPEC.select_exprs_.count();
+}
+
+int ObSelectIntoOp::write_header(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObString> &names = MY_SPEC.header_names_;
+  if (OB_UNLIKELY(names.empty() || names.count() != MY_SPEC.select_exprs_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (has_compress_ && OB_ISNULL(data_writer.get_compress_stream_writer())
+             && OB_FAIL(data_writer.init_compress_writer(ctx_.get_allocator(),
+                       external_properties_.csv_format_.compression_algorithm_,
+                       MY_SPEC.buffer_size_))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    ObObj obj;
+    obj.set_varchar(names.at(i));
+    obj.set_collation_type(cs_type_);
+    OZ(print_field(obj, data_writer));
+    if (OB_SUCC(ret) && i != names.count() - 1) {
+      OZ(write_obj_to_file(field_str_, data_writer));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    OZ(write_obj_to_file(line_str_, data_writer));
+    // The header is a complete line, so make it flushable on its own. Without
+    // this an empty result set would close the writer with the header still
+    // sitting in the buffer and leave an empty file behind.
+    if (!use_shared_buf_) {
+      data_writer.update_last_line_pos();
+      OZ(data_writer.flush_buf());
+    }
+    OZ(data_writer.flush_shared_buf(shared_buf_));
+    if (has_compress_) {
+      OZ(data_writer.flush_buf());
+    }
+    header_written_ = true;
+  }
+  return ret;
 }
 
 

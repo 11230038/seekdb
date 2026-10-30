@@ -52,12 +52,13 @@ private:
 
 class ObSelectIntoSpec : public ObOpSpec
 {
-  OB_UNIS_VERSION_V(1);
+  OB_UNIS_VERSION_V(2);
 public:
   ObSelectIntoSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type),
       into_type_(T_INTO_OUTFILE),
       user_vars_(alloc),
+      header_names_(alloc),
       outfile_name_(),
       field_str_(),
       line_str_(),
@@ -77,6 +78,9 @@ public:
 
   ObItemType into_type_;
   common::ObFixedArray<common::ObString, common::ObIAllocator> user_vars_;
+  // Result column names, parallel to select_exprs_. Used to write the CSV
+  // header row when the format requests PARSE_HEADER.
+  common::ObFixedArray<common::ObString, common::ObIAllocator> header_names_;
   common::ObObj outfile_name_;
   common::ObObj field_str_;
   common::ObObj line_str_;
@@ -126,7 +130,8 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      header_written_(false)
   {
   }
 
@@ -203,6 +208,8 @@ private:
   int into_dumpfile(ObExternalFileWriter *data_writer);
   int into_outfile(ObExternalFileWriter *data_writer);
   int into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFileWriter *data_writer);
+  bool need_write_header() const;
+  int write_header(ObCsvFileWriter &data_writer);
   int extract_fisrt_wchar_from_varhcar(const ObObj &obj, int32_t &wchar);
   int print_wchar_to_buf(char *buf,
                          const int64_t buf_len,
@@ -292,6 +299,7 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  bool header_written_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

@@ -164,6 +164,12 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+    // A rewrite failure happens before the statement reaches the parser, so the
+    // exec context still carries the default need_disconnect=true. Treat these
+    // as ordinary SQL errors, the same way parser errors are treated.
+    if (!ObSQLUtils::check_need_disconnect_parser_err(ret)) {
+      result.get_exec_context().set_need_disconnect(false);
+    }
   } else {
     const ObString effective_stmt = file_sql_rewritten
                                       ? ObString(file_sql.size(), file_sql.data())
@@ -198,6 +204,11 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
   //1 check inited
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(FileSqlRewriter::rewrite(stmt, result.get_session(), file_sql, file_sql_rewritten))) {
+    // See stmt_prepare: rewrite errors are raised before parsing, so keep the
+    // connection for the same error codes the parser would keep it for.
+    if (!ObSQLUtils::check_need_disconnect_parser_err(ret)) {
+      result.get_exec_context().set_need_disconnect(false);
+    }
   } else {
     const ObString effective_stmt = file_sql_rewritten
                                       ? ObString(file_sql.size(), file_sql.data())

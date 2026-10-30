@@ -106,6 +106,26 @@ bool is_ident_char(const char c)
   return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
+bool followed_by_table_alias(const std::string &sql, size_t pos)
+{
+  static const std::set<std::string> keywords = {
+      "where", "group", "order", "limit", "having", "join", "inner", "left", "right",
+      "outer", "cross", "natural", "straight_join", "on", "using", "union", "except",
+      "intersect", "window", "for", "into", "outfile", "set", "values", "partition",
+      "use", "force", "ignore", "procedure", "qualify", "offset", "returning", "with",
+      "lock", "fetch", "tablesample", "when"};
+  while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) { ++pos; }
+  if (pos >= sql.size()) { return false; }
+  const char c = sql[pos];
+  if (c == ',' || c == ')' || c == ';') { return false; }
+  if (c == '`') { return true; }
+  if (!std::isalpha(static_cast<unsigned char>(c)) && c != '_') { return false; }
+  size_t end = pos;
+  while (end < sql.size() && is_ident_char(sql[end])) { ++end; }
+  const std::string word = lower_ascii(sql.substr(pos, end - pos));
+  return word == "as" || keywords.count(word) == 0;
+}
+
 bool is_file_function(const std::string &name)
 {
   const std::string lower = lower_ascii(name);
@@ -357,7 +377,6 @@ void infer_columns(FileData &data)
       if (found == indexes.end()) {
         FileColumn column;
         column.name_ = name;
-        column.nullable_ = data.rows_.Size() > 1;
         data.columns_.push_back(column);
         found = indexes.emplace(name, data.columns_.size() - 1).first;
       }
@@ -402,6 +421,11 @@ std::vector<std::vector<std::string>> parse_csv_rows(const std::string &contents
       if (c == '"') {
         if (i + 1 < contents.size() && contents[i + 1] == '"') { field.push_back('"'); ++i; }
         else { quoted = false; }
+      } else if (c == '\r' && i + 1 < contents.size() && contents[i + 1] == '\n') {
+        // RFC 4180 files are usually CRLF terminated. Normalize the line break
+        // inside a quoted field to '\n' so values do not keep a stray '\r'.
+        field.push_back('\n');
+        ++i;
       } else { field.push_back(c); }
     } else if (c == '"' && field.empty()) {
       quoted = true;
@@ -738,6 +762,62 @@ std::string make_describe_query(const FileData &data)
   return result;
 }
 
+// Parses a boolean COPY option such as "header", "header true" or
+// "header = false". Quoted strings are skipped so option-like text inside a
+// value (for example NULLSTR 'header') is not mistaken for the option itself.
+bool parse_copy_bool_option(const std::string &options, const std::string &name, bool default_value)
+{
+  if (name.empty()) { return default_value; }
+  const size_t name_len = name.size();
+  for (size_t i = 0; i < options.size(); ++i) {
+    const char c = options[i];
+    if (c == '\'' || c == '"') {
+      const char quote = c;
+      for (++i; i < options.size(); ++i) {
+        if (options[i] == quote) {
+          if (i + 1 < options.size() && options[i + 1] == quote) { ++i; }
+          else { break; }
+        }
+      }
+    } else if (ascii_iequal(c, name[0]) && (i == 0 || !is_ident_char(options[i - 1]))
+               && starts_with_ci(options, i, name.c_str())
+               && (i + name_len >= options.size() || !is_ident_char(options[i + name_len]))) {
+      size_t j = i + name_len;
+      while (j < options.size() && std::isspace(static_cast<unsigned char>(options[j]))) { ++j; }
+      if (j < options.size() && options[j] == '=') { ++j; }
+      while (j < options.size() && std::isspace(static_cast<unsigned char>(options[j]))) { ++j; }
+      size_t k = j;
+      while (k < options.size() && is_ident_char(options[k])) { ++k; }
+      const std::string value = lower_ascii(options.substr(j, k - j));
+      if (value == "false" || value == "0" || value == "off" || value == "no") {
+        return false;
+      }
+      return true;
+    }
+  }
+  return default_value;
+}
+
+std::string parse_copy_null_literal(const std::string &options, const std::string &lower)
+{
+  const size_t pos = lower.find("nullstr");
+  if (pos == std::string::npos) { return "'NULL'"; }
+  size_t i = pos + 7;
+  while (i < options.size() && std::isspace(static_cast<unsigned char>(options[i]))) { ++i; }
+  if (i >= options.size() || (options[i] != '\'' && options[i] != '"')) { return "'NULL'"; }
+  const char quote = options[i];
+  const size_t begin = i++;
+  while (i < options.size()) {
+    if (options[i] == quote) {
+      if (i + 1 < options.size() && options[i + 1] == quote) { i += 2; }
+      else { ++i; break; }
+    } else {
+      ++i;
+    }
+  }
+  return options.substr(begin, i - begin);
+}
+
 int rewrite_copy(std::string &sql, bool &copy_rewritten)
 {
   int ret = OB_SUCCESS;
@@ -767,12 +847,23 @@ int rewrite_copy(std::string &sql, bool &copy_rewritten)
   }
   if (pos > trimmed.size()) { return OB_ERR_PARSE_SQL; }
   const std::string path_literal = trimmed.substr(path_begin, pos - path_begin);
-  std::string options = lower_ascii(trimmed.substr(pos));
+  const std::string raw_options = trimmed.substr(pos);
+  const std::string options = lower_ascii(raw_options);
   if (options.find("format csv") == std::string::npos) { return OB_NOT_SUPPORTED; }
-  const bool header = options.find("header") != std::string::npos;
-  sql = trimmed.substr(open + 1, close - open - 1) + " INTO OUTFILE " + path_literal +
-        " FORMAT=(TYPE='CSV', PARSE_HEADER=" + std::string(header ? "TRUE" : "FALSE") +
-        ", NULL_IF=('NULL'))";
+  const bool header = parse_copy_bool_option(options, "header", false);
+  const std::string null_literal = parse_copy_null_literal(raw_options, options);
+  const std::string subquery = trimmed.substr(open + 1, close - open - 1);
+  // COPY has no native grammar, so it is rewritten to SELECT ... INTO OUTFILE.
+  // The header request is forwarded through PARSE_HEADER and the executor
+  // writes the header row itself. That keeps every SELECT shape working
+  // (SELECT *, duplicate names, expressions, ORDER BY, joins, ...) instead of
+  // injecting a header row with UNION ALL, which would change column types
+  // and drop the ordering of the data rows.
+  const std::string sink = " INTO OUTFILE " + path_literal +
+                           " FORMAT=(TYPE='CSV', FIELD_DELIMITER=',', PARSE_HEADER=" +
+                           std::string(header ? "TRUE" : "FALSE") +
+                           ", NULL_IF=(" + null_literal + "))";
+  sql = subquery + sink;
   copy_rewritten = true;
   return ret;
 }
@@ -815,7 +906,11 @@ int FileSqlRewriter::rewrite(const common::ObString &sql,
           FileData data;
           if (OB_FAIL(load_call(call, data))) {
           } else {
-            rewritten_sql.replace(call.begin_, call.end_ - call.begin_, make_json_table(data));
+            std::string replacement = make_json_table(data);
+            if (!followed_by_table_alias(rewritten_sql, call.end_)) {
+              replacement += " AS __file_sql_" + std::to_string(call.begin_);
+            }
+            rewritten_sql.replace(call.begin_, call.end_ - call.begin_, replacement);
           }
         }
         rewritten = OB_SUCC(ret);

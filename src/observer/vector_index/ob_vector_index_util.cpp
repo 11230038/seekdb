@@ -1693,13 +1693,32 @@ int ObVectorIndexUtil::get_vector_dim_from_extend_type_info(const ObIArray<ObStr
 {
   int ret = OB_SUCCESS;
   dim = 0;
-  if (extend_type_info.count() != 1) {
+  ObString vector_entry;
+  int64_t vector_entry_count = 0;
+  if (1 == extend_type_info.count()) {
+    vector_entry = extend_type_info.at(0);
+    vector_entry_count = 1;
+  } else {
     // Vector index columns currently only support single column vector indexes.
-    // When building the vector column of the auxiliary table, only one column of extend_type_info is assigned.
+    // An AI column keeps its generation spec (AI_FUNC=..., AI_MODEL=...) in the
+    // same type info array, so the vector marker has to be looked up instead of
+    // assuming the array holds exactly one entry.
+    for (int64_t i = 0; i < extend_type_info.count(); ++i) {
+      // split_on consumes its target, so keep the original entry for the copy.
+      ObString entry = extend_type_info.at(i);
+      ObString type_name = (NULL != entry.find('(')) ? entry.split_on('(') : entry;
+      type_name = type_name.trim();
+      if (0 == type_name.compare("VECTOR") || 0 == type_name.compare("SPARSEVECTOR")) {
+        ++vector_entry_count;
+        vector_entry = extend_type_info.at(i);
+      }
+    }
+  }
+  if (1 != vector_entry_count) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "vector column index only support build on one vector column");
   } else {
-    ObString extend_type_info_str = extend_type_info.at(0);
+    ObString extend_type_info_str = vector_entry;
     ObString spilt_str = extend_type_info_str.split_on('(').trim();
     if (0 == spilt_str.compare("ARRAY") || 0 == spilt_str.compare("MAP")) {
       ret = OB_NOT_SUPPORTED;
@@ -1724,14 +1743,28 @@ int ObVectorIndexUtil::get_vector_dim_from_extend_type_info(const ObIArray<ObStr
   int ret = OB_SUCCESS;
   is_sparse_vec_col = false;
 
-  if (extend_type_info.count() != 1) {
-    // sparse vector index columns currently only support single column vector indexes.
-    // When building the vector column of the auxiliary table, only one column of extend_type_info is assigned.
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vector index on more than one column is");
-  } else {
+  if (1 == extend_type_info.count()) {
     ObString str = extend_type_info.at(0);
     is_sparse_vec_col = (0 == str.compare("SPARSEVECTOR"));
+  } else {
+    // sparse vector index columns currently only support single column vector indexes.
+    // An AI column appends its generation spec to the type info array, so count
+    // the vector markers instead of requiring a single entry.
+    int64_t vector_entry_count = 0;
+    for (int64_t i = 0; i < extend_type_info.count(); ++i) {
+      // split_on consumes its target, so keep the original entry for the check.
+      ObString entry = extend_type_info.at(i);
+      ObString type_name = (NULL != entry.find('(')) ? entry.split_on('(') : entry;
+      type_name = type_name.trim();
+      if (0 == type_name.compare("VECTOR") || 0 == type_name.compare("SPARSEVECTOR")) {
+        ++vector_entry_count;
+        is_sparse_vec_col = (0 == type_name.compare("SPARSEVECTOR"));
+      }
+    }
+    if (1 != vector_entry_count) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vector index on more than one column is");
+    }
   }
 
   return ret;

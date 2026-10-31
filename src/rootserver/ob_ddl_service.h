@@ -88,6 +88,7 @@ class ObDDLService : public query::ObIAuxIndexSchemaChecker
 {
 public:
   friend class ObPLDDLService;
+  friend class ObTableHelper;
   ObDDLService();
   virtual ~ObDDLService() {}
 
@@ -1035,6 +1036,12 @@ int check_will_be_having_domain_index_operation(
                                              const share::schema::ObTableSchema &table_schema,
                                              const obcall::ObAlterTableArg &alter_table_arg,
                                              bool &is_only_creata_index_on_empty_table);
+  int write_ai_column_metadata(const share::schema::ObTableSchema &table_schema,
+                               common::ObISQLClient &sql_client);
+  int add_ai_hidden_columns_for_alter(share::schema::ObTableSchema &new_table_schema,
+                                      const uint64_t ai_column_id,
+                                      ObDDLOperator *ddl_operator,
+                                      common::ObMySQLTransaction *trans);
   int alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                            obcall::ObAlterTableRes &res,
                            const uint64_t data_format_version);

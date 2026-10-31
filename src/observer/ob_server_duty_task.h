@@ -40,6 +40,22 @@ private:
   common::ObArenaAllocator allocator_;
 };
 
+class ObAiColumnWorkerTask : private common::ObTimerTask
+{
+public:
+  int schedule(common::ObTimer &timer);
+  ObAiColumnWorkerTask();
+private:
+  void runTimerTask() override;
+  // Pick the due tasks, call the model for every result column of a row, write
+  // all results of the row in one statement and maintain the task table.
+  int process_tasks();
+private:
+  static constexpr int64_t SCHEDULE_PERIOD = 200 * 1000L;  // 200ms
+  common::ObArenaAllocator allocator_;
+  bool running_;
+};
+
 class ObSqlMemoryTimerTask : private common::ObTimerTask
 {
 public:

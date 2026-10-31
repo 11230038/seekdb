@@ -762,6 +762,10 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (stmt.is_ai_column_retry()) {
+    if (OB_FAIL(execute_ai_column_retry(ctx, stmt))) {
+      SQL_ENG_LOG(WARN, "execute ai column retry failed", K(ret));
+    }
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;
@@ -878,6 +882,40 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
       "table_info", table_info_buffer,
       "schema_version", res.schema_version_);
     SQL_ENG_LOG(INFO, "finish alter table execute.", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()), K(first_stmt));
+  }
+  return ret;
+}
+
+// A retry invalidates the AI column of the selected rows by setting it to
+// NULL. The regular DML path of the inner UPDATE then records the rows which
+// need a fresh value, so the worker regenerates them as usual.
+int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx,
+                                                  ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
+  const ObString &db_name = stmt.get_database_name();
+  const ObString &table_name = stmt.get_table_name();
+  const ObString &column_name = stmt.get_ai_retry_column();
+  const ObString &predicate = stmt.get_ai_retry_predicate();
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(sql_proxy) || db_name.empty() || table_name.empty()
+      || column_name.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "invalid ai column retry statement", K(ret), K(stmt));
+  } else if (OB_FAIL(sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = null",
+                                    db_name.length(), db_name.ptr(),
+                                    table_name.length(), table_name.ptr(),
+                                    column_name.length(), column_name.ptr()))) {
+    SQL_ENG_LOG(WARN, "build ai column retry sql failed", K(ret));
+  } else if (!predicate.empty()
+             && OB_FAIL(sql.append_fmt(" %.*s", predicate.length(), predicate.ptr()))) {
+    SQL_ENG_LOG(WARN, "build ai column retry sql failed", K(ret));
+  } else if (OB_FAIL(sql_proxy->write(sql.string(), affected_rows))) {
+    SQL_ENG_LOG(WARN, "execute ai column retry failed", K(ret), K(sql));
+  } else {
+    SQL_ENG_LOG(INFO, "ai column retry finished", K(sql), K(affected_rows));
   }
   return ret;
 }

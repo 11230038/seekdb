@@ -17,6 +17,9 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "ob_dml_resolver.h"
+#include "lib/string/ob_sql_string.h"
+#include "common/mysqlclient/ob_isql_client.h"
+#include "common/mysqlclient/ob_mysql_result.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
@@ -51,6 +54,15 @@ using namespace pl;
 
 namespace sql
 {
+namespace
+{
+// The strict read check inspects the AI column with an inner query. That query
+// references the very same AI column, so without this flag resolving it would
+// start another check and recurse forever. The inner query runs synchronously
+// on the current thread, which makes a thread local flag sufficient.
+thread_local bool g_ai_column_strict_check_running = false;
+} // namespace
+
 ObDMLResolver::ObDMLResolver(ObResolverParams &params)
     : ObStmtResolver(params),
       current_scope_(T_NONE_SCOPE),
@@ -1885,6 +1897,7 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
     } else if (OB_FAIL(get_column_schema(tid, column_name, col_schema, include_hidden))) {
     } else if (OB_ISNULL(col_schema)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(check_ai_column_strict_read(table_item, *col_schema))) {
     } else if (OB_FAIL(ObRawExprUtils::build_column_expr(*params_.expr_factory_, *col_schema, session_info_, col_expr))) {
     } else if (OB_FAIL(table_schema->is_unique_key_column(*schema_guard,
                                                           col_schema->get_column_id(),
@@ -1959,6 +1972,64 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
         col_item = stmt->get_column_item(stmt->get_column_size() - 1);
       }
     }
+  }
+  return ret;
+}
+
+// An AI column is complete only when every row of the table already has its
+// generated value. The check is column-wide: a statement which touches the
+// column is rejected even if the rows it happens to read are all ready.
+int ObDMLResolver::check_ai_column_strict_read(
+    const TableItem &table_item,
+    const share::schema::ObColumnSchemaV2 &column_schema)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  if (!column_schema.is_ai_column()
+      || OB_ISNULL(session_info_)
+      || OB_ISNULL(params_.sql_proxy_)) {
+    // nothing to check
+  } else if (session_info_->is_real_inner_session() || params_.is_restore_) {
+    // the AI column worker and restore always see the raw values
+  } else if (table_item.database_name_.empty() || table_item.table_name_.empty()) {
+    // the statement does not address a concrete table we can inspect
+  } else if (OB_FAIL(session_info_->get_sys_variable(
+                 share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+    LOG_WARN("get ai_column_strict_read failed", K(ret));
+  } else if (!strict_read) {
+    // strict reads are disabled for this session
+  } else if (g_ai_column_strict_check_running) {
+    // the check statement itself references the AI column, do not recurse
+  } else {
+    ObSqlString sql;
+    ObISQLClient::ReadResult res;
+    sqlclient::ObMySQLResult *result = NULL;
+    const ObString &column_name = column_schema.get_column_name_str();
+    g_ai_column_strict_check_running = true;
+    if (OB_FAIL(sql.append_fmt("select 1 from `%.*s`.`%.*s` where `%.*s` is null limit 1",
+                               table_item.database_name_.length(),
+                               table_item.database_name_.ptr(),
+                               table_item.table_name_.length(),
+                               table_item.table_name_.ptr(),
+                               column_name.length(), column_name.ptr()))) {
+    } else if (OB_FAIL(params_.sql_proxy_->read(res, sql.ptr(), 0))) {
+      LOG_WARN("inspect ai column values failed", K(ret), K(sql));
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("result of ai column inspection is null", K(ret));
+    } else {
+      const int next_ret = result->next();
+      if (OB_SUCCESS == next_ret) {
+        LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASK,
+                       static_cast<unsigned long>(column_schema.get_table_id()),
+                       static_cast<unsigned long>(column_schema.get_column_id()));
+        ret = OB_AI_COLUMN_UNFINISHED_TASK;
+      } else if (OB_ITER_END != next_ret) {
+        ret = next_ret;
+        LOG_WARN("inspect ai column values failed", K(ret), K(sql));
+      }
+    }
+    g_ai_column_strict_check_running = false;
   }
   return ret;
 }

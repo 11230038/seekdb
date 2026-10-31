@@ -293,6 +293,9 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline bool is_domain_index_column() const { return is_vec_index_column() || is_fulltext_column() || is_multivalue_generated_column() || is_multivalue_generated_array_column(); }
   inline bool has_generated_column_deps() const { return column_flags_ & GENERATED_DEPS_CASCADE_FLAG; }
   inline bool is_invisible_column() const { return column_flags_ & INVISIBLE_COLUMN_FLAG; }
+  inline bool is_ai_column() const { return column_flags_ & AI_COLUMN_FLAG; }
+  inline bool is_ai_column_internal_column() const
+  { return is_hidden() && get_column_name_str().prefix_match(OB_AI_INTERNAL_COLUMN_NAME_PREFIX); }
   inline bool has_column_flag(int64_t flag) const { return column_flags_ & flag; }
   inline int64_t get_column_flags() const { return column_flags_; }
   //these column flags must be stored in __all_column

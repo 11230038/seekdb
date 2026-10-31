@@ -51,10 +51,14 @@ int ObVecIndexDMLIterator::generate_domain_rows(const ObChunkDatumStore::StoredR
     if (OB_FAIL(get_vector_index_column_idxs(vec_id_idx, type_idx, vector_idx))) {
     }
     for (int i = 0; OB_SUCC(ret) && i < row_cnt; i++) {
+      bool skip_row = false;
       if (!is_update_ && OB_FAIL(get_vec_data(store_row, vec_id_idx, vector_idx, vec_id, vector))) {
       } else if (is_update_ && OB_FAIL(get_vec_data_for_update(store_row, vec_id_idx, vector_idx, vec_id, vector))) {
-      } else if (OB_FAIL(generate_vec_delta_buff_row(allocator_, store_row, vec_id_idx, type_idx, vector_idx, vec_id, vector, rows_))) {
-      } else if (is_update) {
+      } else if (OB_FAIL(check_skip_vec_delete_marker(store_row, vector_idx, is_update, is_old_row_, skip_row))) {
+      } else if (OB_SUCC(ret) && !skip_row
+                 && OB_FAIL(generate_vec_delta_buff_row(allocator_, store_row, vec_id_idx, type_idx, vector_idx, vec_id, vector, rows_))) {
+      }
+      if (OB_SUCC(ret) && is_update) {
         is_old_row_ = !is_old_row_;
       }
     }
@@ -202,6 +206,38 @@ int ObVecIndexDMLIterator::generate_vec_delta_buff_row(common::ObIAllocator &all
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(rows.push_back(row))) {
     } else {
+    }
+  }
+  return ret;
+}
+
+// The delta buffer has no entry for a row whose vector is null, so there is
+// nothing to cancel with a delete marker. Writing the marker anyway would
+// collide with the marker written when the same vector was invalidated, e.g.
+// an AI column is set to NULL by the user transaction and later recomputed by
+// the background worker.
+int ObVecIndexDMLIterator::check_skip_vec_delete_marker(
+    const ObChunkDatumStore::StoredRow *store_row,
+    const int64_t vector_idx,
+    const bool is_update,
+    const bool is_old_row,
+    bool &skip_row) const
+{
+  int ret = OB_SUCCESS;
+  skip_row = false;
+  const bool is_delete_marker = is_update ? is_old_row
+                                          : ObDASOpType::DAS_OP_TABLE_DELETE == das_ctdef_->op_type_;
+  if (is_delete_marker) {
+    const IntFixedArray *proj = is_update
+        ? (is_old_row ? &das_ctdef_->old_row_projector_ : &das_ctdef_->new_row_projector_)
+        : row_projector_;
+    if (OB_ISNULL(store_row) || OB_ISNULL(proj)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_UNLIKELY(vector_idx >= proj->count() || proj->at(vector_idx) >= store_row->cnt_)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const ObDatum &vec_datum = store_row->cells()[proj->at(vector_idx)];
+      skip_row = vec_datum.is_null() || vec_datum.get_string().empty();
     }
   }
   return ret;

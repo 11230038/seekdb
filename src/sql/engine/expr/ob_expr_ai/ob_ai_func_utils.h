@@ -353,6 +353,12 @@ public:
    virtual ~ObAIFuncModel() {}
    // completion
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
+   // completion with an explicit system prompt, the AI column worker uses it
+   // to send the persisted instruction together with the user content
+   int call_completion_with_system(ObString &system_prompt,
+                                   ObString &prompt,
+                                   ObJsonObject *config,
+                                   ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);

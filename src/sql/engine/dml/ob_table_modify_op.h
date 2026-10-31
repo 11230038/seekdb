@@ -276,6 +276,12 @@ protected:
   //such as: set affected_rows to query context, rewrite some error code
   virtual int write_rows_post_proc(int last_errno)
   { UNUSED(last_errno); return common::OB_NOT_IMPLEMENT; }
+  // Keep the AI column task table in sync with the rows modified by the
+  // current statement: a task is created for every row whose AI column is
+  // still waiting for a result, and pending tasks of deleted rows (or of
+  // rows whose rowkey changed) are removed. The work is done in the same
+  // transaction as the DML, so a rollback also rolls the task changes back.
+  int ai_column_task_sync();
   virtual ObDasParallelType check_das_parallel_type();
 
   int init_das_dml_ctx();

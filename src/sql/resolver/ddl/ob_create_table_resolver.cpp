@@ -25,6 +25,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
+#include "share/schema/ob_ai_column_util.h"
 
 namespace oceanbase
 {
@@ -101,6 +102,128 @@ int ObCreateTableResolver::add_primary_key_part(const ObString &column_name,
       SQL_RESV_LOG(WARN, "fail to find column stat", K(ret), K(column_name));
     } else if (stat->is_set_null_ || (stat->is_set_default_value_ && col->get_cur_default_value().is_null())) {
       ret = OB_ERR_PRIMARY_CANT_HAVE_NULL;
+    }
+  }
+  return ret;
+}
+
+namespace {
+
+int create_ai_hidden_column(ObTableSchema &table_schema,
+                            const char *name_prefix,
+                            const ObString &ai_column_name,
+                            const uint64_t column_id,
+                            const ObObjType data_type,
+                            const int64_t data_length)
+{
+  int ret = OB_SUCCESS;
+  char col_name[OB_MAX_COLUMN_NAME_LENGTH] = {'\0'};
+  int64_t name_pos = 0;
+  if (OB_FAIL(databuff_printf(col_name, sizeof(col_name), name_pos, "%s%.*s",
+                              name_prefix, ai_column_name.length(), ai_column_name.ptr()))) {
+    SQL_RESV_LOG(WARN, "failed to build ai hidden column name", K(ret), K(ai_column_name));
+  } else if (OB_NOT_NULL(table_schema.get_column_schema(col_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "ai hidden column name conflict", K(ret), KCSTRING(col_name));
+  } else {
+    ObColumnSchemaV2 hidden_column;
+    hidden_column.set_column_id(column_id);
+    hidden_column.set_table_id(table_schema.get_table_id());
+    hidden_column.set_is_hidden(true);
+    hidden_column.set_nullable(true);
+    hidden_column.set_data_type(data_type);
+    hidden_column.set_data_length(data_length);
+    hidden_column.set_collation_type(ObCharset::get_system_collation());
+    hidden_column.set_prev_column_id(UINT64_MAX);
+    hidden_column.set_next_column_id(UINT64_MAX);
+    if (OB_FAIL(hidden_column.set_column_name(col_name))) {
+    } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
+      SQL_RESV_LOG(WARN, "failed to add ai hidden column", K(ret), KCSTRING(col_name));
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
+int ObCreateTableResolver::resolve_ai_columns(ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 4> ai_column_ids;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (column->is_ai_column() && OB_FAIL(ai_column_ids.push_back(column->get_column_id()))) {
+    }
+  }
+  if (OB_SUCC(ret) && !ai_column_ids.empty()) {
+    // An AI column may only depend on ordinary columns: an AI column value is
+    // produced asynchronously and can not be an input of another AI column.
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_ids.count(); ++i) {
+      ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(ai_column_ids.at(i));
+      ObAiColumnSpec spec;
+      if (OB_ISNULL(ai_column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(parse_ai_column_spec(ai_column->get_extended_type_info(), spec))) {
+      } else {
+        for (int64_t j = 0; OB_SUCC(ret) && j < spec.deps_.count(); ++j) {
+          const ObString &dep_name = spec.deps_.at(j);
+          const ObColumnSchemaV2 *dep_column = NULL;
+          for (int64_t k = 0; NULL == dep_column && k < table_schema.get_column_count(); ++k) {
+            const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(k);
+            if (OB_NOT_NULL(column) && 0 == column->get_column_name_str().case_compare(dep_name)) {
+              dep_column = column;
+            }
+          }
+          if (OB_ISNULL(dep_column)) {
+            ret = OB_ERR_BAD_FIELD_ERROR;
+            ObString scope_name = "ai column function";
+            LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, dep_name.length(), dep_name.ptr(),
+                           scope_name.length(), scope_name.ptr());
+          } else if (dep_column->is_ai_column()) {
+            ret = OB_NOT_SUPPORTED;
+            SQL_RESV_LOG(WARN, "ai column can not depend on another ai column", K(ret),
+                         K(dep_name), K(ai_column->get_column_name_str()));
+          }
+        }
+      }
+    }
+  }
+
+  // Generate the three hidden columns of every AI column and remember their
+  // column ids in the AI column spec.
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_ids.count(); ++i) {
+    ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(ai_column_ids.at(i));
+    if (OB_ISNULL(ai_column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const ObString ai_column_name = ai_column->get_column_name_str();
+      const uint64_t state_column_id = gen_column_id();
+      const uint64_t request_column_id = gen_column_id();
+      const uint64_t spec_column_id = gen_column_id();
+      if (OB_FAIL(create_ai_hidden_column(table_schema, OB_AI_STATE_COLUMN_NAME_PREFIX,
+                                          ai_column_name, state_column_id,
+                                          ObIntType, sizeof(int64_t)))) {
+      } else if (OB_FAIL(create_ai_hidden_column(table_schema, OB_AI_REQUEST_COLUMN_NAME_PREFIX,
+                                                 ai_column_name, request_column_id,
+                                                 ObIntType, sizeof(int64_t)))) {
+      } else if (OB_FAIL(create_ai_hidden_column(table_schema, OB_AI_SPEC_COLUMN_NAME_PREFIX,
+                                                 ai_column_name, spec_column_id,
+                                                 ObVarcharType, 4096))) {
+      } else {
+        ObSEArray<ObString, 8> type_info;
+        if (OB_FAIL(type_info.assign(ai_column->get_extended_type_info()))) {
+        } else if (OB_FAIL(add_ai_type_info_int_entry(OB_AI_TYPE_INFO_STATE_COL_PREFIX,
+                                                       state_column_id, *allocator_, type_info))) {
+        } else if (OB_FAIL(add_ai_type_info_int_entry(OB_AI_TYPE_INFO_REQUEST_COL_PREFIX,
+                                                       request_column_id, *allocator_, type_info))) {
+        } else if (OB_FAIL(add_ai_type_info_int_entry(OB_AI_TYPE_INFO_SPEC_COL_PREFIX,
+                                                       spec_column_id, *allocator_, type_info))) {
+        } else if (OB_FAIL(ai_column->set_extended_type_info(type_info))) {
+          SQL_RESV_LOG(WARN, "failed to record ai hidden column ids", K(ret), K(ai_column_name));
+        }
+      }
     }
   }
   return ret;
@@ -931,7 +1054,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // do nothing
       } else if (OB_FAIL(resolve_primary_key_node(*primary_node, stats))) {
       }
-      if (OB_SUCC(ret)) {
+      if (OB_SUCC(ret) && RESOLVE_ALL == resolve_rule
+          && OB_FAIL(resolve_ai_columns(table_schema))) {
+      } else if (OB_SUCC(ret)) {
         table_schema.set_max_used_column_id(cur_column_id_);
         if (0 != autoinc_column_id) {
           table_schema.set_autoinc_column_id(autoinc_column_id);

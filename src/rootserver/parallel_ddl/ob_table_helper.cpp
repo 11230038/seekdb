@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX RS
 #include "rootserver/parallel_ddl/ob_table_helper.h"
+#include "rootserver/ob_ddl_service.h"
 #include "rootserver/ob_index_builder.h"
 #include "rootserver/ob_lob_meta_builder.h"
 #include "rootserver/ob_lob_piece_builder.h"
@@ -210,6 +211,12 @@ int ObTableHelper::create_tables_(const ObString *ddl_stmt_str)
                 get_trans_(),
                 ddl_stmt_str,
                 true/*sync_schema_version_for_last_table*/))) {
+    }
+    // AI column metadata is written in the same transaction as the schema.
+    for (int64_t i = 0; OB_SUCC(ret) && i < new_tables_.count(); i++) {
+      if (OB_FAIL(ddl_service_->write_ai_column_metadata(new_tables_.at(i), get_trans_()))) {
+        LOG_WARN("failed to write ai column metadata", K(ret), K(new_tables_.at(i).get_table_name_str()));
+      }
     }
   }
   return ret;

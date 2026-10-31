@@ -151,10 +151,14 @@ function Generate-Parser {
     $flex = Find-Exe $FLEX_BIN
     Write-Host "Using bison: $bison"
     Write-Host "Using flex:  $flex"
+    # Run tools from the parser dir with relative input names so generated #line
+    # directives stay relative (absolute paths containing non-ASCII characters
+    # are rejected by clang-cl as illegal string literal encoding).
+    Push-Location $ParserDir
 
     # ---- FTS parser ----
     Write-Host "Generating FTS parser..."
-    Bison-Parser (Join-Path $ParserDir "ftsparser.y") (Join-Path $ParserDir "ftsparser_tab.c")
+    Bison-Parser "ftsparser.y" "ftsparser_tab.c"
 
     $ftsparserTabH = Join-Path $ParserDir "ftsparser_tab.h"
     # Bison-generated include guard varies by path (e.g. YY_OBSQL_FTS_YY_C_..._FTSPARSER_TAB_H_INCLUDED); match fixed suffix only
@@ -164,7 +168,7 @@ function Generate-Parser {
     Patch-FileRegex $ftsparserTabC 'yychar = yylex \(&yylval, &yylloc, yyscanner\);' 'yychar = yylex (&yylval, &yylloc, YYLEX_PARAM);'
     Patch-FileRegex $ftsparserTabC 'yychar = yylex \(&yylval, &yylloc\);' 'yychar = yylex (&yylval, &yylloc, YYLEX_PARAM);'
 
-    & $FLEX_BIN -Cfa -B -8 -o (Join-Path $ParserDir "ftsblex_lex.c") (Join-Path $ParserDir "ftsblex.l") $ftsparserTabH
+    & $FLEX_BIN -Cfa -B -8 -o "ftsblex_lex.c" "ftsblex.l" "ftsparser_tab.h"
 
     $ftslex = Join-Path $ParserDir "ftsblex_lex.c"
     Remove-LinesContaining $ftslex "This var may be unused depending upon options"
@@ -187,9 +191,9 @@ function Generate-Parser {
     Write-Host "Generating MySQL mode parser..."
     $mysqlTabC = Join-Path $ParserDir "sql_parser_mysql_mode_tab.c"
     $mysqlOutput = Join-Path $ParserDir "sql_parser_mysql_mode.output"
-    Bison-Parser (Join-Path $ParserDir "sql_parser_mysql_mode.y") $mysqlTabC $mysqlOutput
+    Bison-Parser "sql_parser_mysql_mode.y" "sql_parser_mysql_mode_tab.c" "sql_parser_mysql_mode.output"
 
-    & $FLEX_BIN -Cfa -B -8 -o (Join-Path $ParserDir "sql_parser_mysql_mode_lex.c") (Join-Path $ParserDir "sql_parser_mysql_mode.l") (Join-Path $ParserDir "sql_parser_mysql_mode_tab.h")
+    & $FLEX_BIN -Cfa -B -8 -o "sql_parser_mysql_mode_lex.c" "sql_parser_mysql_mode.l" "sql_parser_mysql_mode_tab.h"
 
     $mysqlLex = Join-Path $ParserDir "sql_parser_mysql_mode_lex.c"
     $mysqlContent = [System.IO.File]::ReadAllText($mysqlLex)
@@ -227,6 +231,7 @@ function Generate-Parser {
     $lines += "`tdefault:return `"Unknown`";", "`t}", "}"
     $lines | Set-Content $typeNameC -Encoding UTF8
 
+    Pop-Location
     Write-Host "Done. Generated: ftsparser_tab.c/h, ftsblex_lex.c, sql_parser_mysql_mode_tab.c/h, sql_parser_mysql_mode_lex.c, type_name.c"
 }
 

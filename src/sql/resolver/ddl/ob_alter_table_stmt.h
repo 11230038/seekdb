@@ -92,6 +92,17 @@ public:
   const common::ObSArray<obcall::ObIndexArg*> &get_alter_index_arg_list() const 
     { return alter_table_arg_.index_arg_list_; }
 
+  // ALTER TABLE ... RETRY AI COLUMN <column> [WHERE <predicate>]
+  // The statement is executed as an UPDATE which clears the AI column of the
+  // matching rows; the worker regenerates the values afterwards.
+  bool is_ai_column_retry() const { return is_ai_column_retry_; }
+  void set_is_ai_column_retry(const bool flag) { is_ai_column_retry_ = flag; }
+  const common::ObString &get_ai_retry_column() const { return ai_retry_column_; }
+  void set_ai_retry_column(const common::ObString &column) { ai_retry_column_ = column; }
+  const common::ObString &get_ai_retry_predicate() const { return ai_retry_predicate_; }
+  void set_ai_retry_predicate(const common::ObString &predicate)
+  { ai_retry_predicate_ = predicate; }
+
   obcall::ObAlterTriggerArg &get_tg_arg() { return tg_arg_; }
   const ObTableSchema &get_alter_table_schema() const { return alter_table_arg_.alter_table_schema_; }
   ObTableSchema &get_alter_table_schema() { return alter_table_arg_.alter_table_schema_; }
@@ -114,6 +125,9 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  bool is_ai_column_retry_;
+  common::ObString ai_retry_column_;
+  common::ObString ai_retry_predicate_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

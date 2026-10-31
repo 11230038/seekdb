@@ -84,6 +84,12 @@ protected:
                             bool before_update_row_trigger_exist,
                             const share::schema::ObColumnSchemaV2 &column,
                             bool &need_assign);
+  // an AI column is invalidated when one of its dependencies (or the rowkey)
+  // is assigned by the current DML statement
+  int check_ai_column_need_assignment(const share::schema::ObTableSchema &table_schema,
+                                      const common::ObIArray<ObAssignment> &assigns,
+                                      const share::schema::ObColumnSchemaV2 &column,
+                                      bool &need_assign);
 
   int set_base_table_for_updatable_view(TableItem &table_item,
                                         const ObColumnRefRawExpr &col_ref,

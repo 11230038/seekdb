@@ -484,6 +484,7 @@ private:
   common::ObTimer sql_mem_timer_;
   common::ObTimer ctas_clean_up_timer_;
   ObServerDutyTask duty_task_;
+  ObAiColumnWorkerTask ai_column_worker_task_;
   ObSqlMemoryTimerTask sql_mem_task_;
   ObCTASCleanUpTask ctas_clean_up_task_;     // repeat & no retry
   ObRedefTableHeartBeatTask redef_table_heart_beat_task_;

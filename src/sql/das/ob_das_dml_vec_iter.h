@@ -56,6 +56,12 @@ protected:
       const int64_t vector_idx,
       int64_t &vec_id,
       ObString &vector);
+  int check_skip_vec_delete_marker(
+      const ObChunkDatumStore::StoredRow *store_row,
+      const int64_t vector_idx,
+      const bool is_update,
+      const bool is_old_row,
+      bool &skip_row) const;
 private:
   virtual int generate_domain_rows(const ObChunkDatumStore::StoredRow *store_row) override;
   int generate_vec_delta_buff_row(common::ObIAllocator &allocator,

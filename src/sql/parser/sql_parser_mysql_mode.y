@@ -420,7 +420,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_float_precision opt_number_precision
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
-%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list opt_ai_column_with_options ai_column_option_list ai_column_option
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -6238,6 +6238,48 @@ not NULLX
 | INVISIBLE
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
+}
+| AI COLUMN '(' expr ')' opt_ai_column_with_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN, 2, $4, $6);
+  dup_expr_string($$, result, @4.first_column, @4.last_column);
+}
+;
+
+opt_ai_column_with_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  merge_nodes($$, result, T_AI_COLUMN_OPTION_LIST, $3);
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+NAME_OB COMP_EQ INTNUM
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 1, $3);
+  $$->str_value_ = $1->str_value_;
+  $$->str_len_ = $1->str_len_;
+}
+| NAME_OB COMP_EQ STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 1, $3);
+  $$->str_value_ = $1->str_value_;
+  $$->str_len_ = $1->str_len_;
 }
 ;
 
@@ -14728,6 +14770,23 @@ opt_set table_option_list_space_seperated
 DROP CONSTRAINT constraint_name
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_DROP_CONSTRAINT, 1, $3); // drop foreign key or check constraint, to be compatible with mysql
+}
+// ALTER TABLE ... RETRY AI COLUMN <column> [WHERE <predicate>]
+// RETRY is not a reserved word, so it arrives as a plain identifier and is
+// validated here. The WHERE text is kept verbatim; it is replayed as the
+// predicate of the UPDATE which retries the AI column.
+| NAME_OB AI COLUMN column_name opt_where
+{
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)
+      || 0 != strcasecmp("retry", $1->str_value_)) {
+    yyerror(&@1, result, "AI COLUMN action must start with RETRY");
+    YYABORT_PARSE_SQL_ERROR;
+  } else {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+    if (NULL != $5) {
+      dup_expr_string($$, result, @5.first_column, @5.last_column);
+    }
+  }
 }
 | ALGORITHM opt_equal_mark algorithm_opt
 {

@@ -365,6 +365,11 @@ protected:
                                 bool include_hidden,
                                 ColumnItem *&col_item,
                                 ObDMLStmt *stmt = NULL);
+  // When the session enables ai_column_strict_read, a statement which touches
+  // an AI column is rejected while any row of the column has no value yet.
+  int check_ai_column_strict_read(
+      const TableItem &table_item,
+      const share::schema::ObColumnSchemaV2 &column_schema);
   int adjust_values_desc_position(ObInsertTableInfo& table_info,
                                   ObIArray<int64_t> &value_idxs);
 public:

@@ -4872,10 +4872,22 @@ int ObRawExprUtils::init_column_expr_subschema(const share::schema::ObColumnSche
     }
   } else if (column_schema.is_collection()) {
     uint16_t subschema_id = 0;
-    if (OB_UNLIKELY(column_schema.get_extended_type_info().count() != 1)) {
+    // An AI column keeps its AI spec as key=value entries right after the SQL
+    // type string, so the plain type string is not necessarily the only entry.
+    const ObString *type_string = NULL;
+    for (int64_t i = 0;
+         OB_SUCC(ret) && NULL == type_string && i < column_schema.get_extended_type_info().count();
+         ++i) {
+      const ObString &type_info = column_schema.get_extended_type_info().at(i);
+      if (NULL == type_info.find('=')) {
+        type_string = &type_info;
+      }
+    }
+    if (OB_SUCC(ret) && OB_UNLIKELY(NULL == type_string)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(
-                                  column_schema.get_extended_type_info().at(0), subschema_id))) {
+      LOG_WARN("collection column without type info", K(ret), K(column_schema.get_column_name_str()));
+    } else if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(*type_string, subschema_id))) {
     } else {
       column_expr.set_subschema_id(subschema_id);
     }

@@ -24,6 +24,7 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "share/schema/ob_ai_column_util.h"
 
 namespace oceanbase
 {
@@ -465,7 +466,8 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
                                                                  as.column_expr_->get_column_id(),
                                                                  update_with_vector_index,
                                                                  index_type))) {
-    } else if (!update_with_vector_index && !part_key_col_ids.empty()) {
+    }
+    if (OB_SUCC(ret) && !update_with_vector_index && !part_key_col_ids.empty()) {
       // check if update with part key, update with part key should also update vid
       if (has_exist_in_array(part_key_col_ids, as.column_expr_->get_column_id())) {
         update_with_vector_index = true;
@@ -534,7 +536,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                  trigger_exist,
                                                  *column_schema,
                                                  need_assigned))) {
-        } else if (FALSE_IT(need_assigned = need_assigned || 
+        } else if (OB_SUCC(ret) && !need_assigned && column_schema->is_ai_column()
+                   && OB_FAIL(check_ai_column_need_assignment(*table_schema,
+                                                              assigns.at(i).assignments_,
+                                                              *column_schema,
+                                                              need_assigned))) {
+        } else if (FALSE_IT(need_assigned = need_assigned ||
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
@@ -562,6 +569,13 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
               if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
                                            col_item->expr_->get_dependant_expr(),
                                            assignment.expr_))) {
+              }
+            } else if (column_schema->is_ai_column()) {
+              // The AI result is no longer valid once one of its dependencies
+              // (or the rowkey) is modified. Invalidate it in the same
+              // transaction, the background worker recomputes it later.
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_,
+                                                          assignment.expr_))) {
               }
             } else if (trigger_exist) {
               assignment.expr_ = col_item->expr_;
@@ -734,6 +748,41 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
     } else if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id, column.get_column_id(), exist))) {
     } else if (!exist) {
       need_assign = true;
+    }
+  }
+  return ret;
+}
+
+int ObDelUpdResolver::check_ai_column_need_assignment(
+    const share::schema::ObTableSchema &table_schema,
+    const common::ObIArray<ObAssignment> &assigns,
+    const share::schema::ObColumnSchemaV2 &column,
+    bool &need_assign)
+{
+  int ret = OB_SUCCESS;
+  need_assign = false;
+  share::schema::ObAiColumnSpec spec;
+  common::ObSEArray<uint64_t, 4> rowkey_ids;
+  if (OB_FAIL(share::schema::parse_ai_column_spec(column.get_extended_type_info(), spec))) {
+  } else if (OB_FAIL(table_schema.get_rowkey_column_ids(rowkey_ids))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_assign && i < assigns.count(); ++i) {
+    const ObColumnRefRawExpr *assigned_expr = assigns.at(i).column_expr_;
+    if (OB_ISNULL(assigned_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("assigned column expr is null", K(ret));
+    } else if (assigned_expr->get_column_id() == column.get_column_id()) {
+      // the AI column itself is assigned explicitly, keep the user value
+      break;
+    } else if (common::has_exist_in_array(rowkey_ids, assigned_expr->get_column_id())) {
+      // a rowkey change re-creates the row, the AI result cannot be carried over
+      need_assign = true;
+    } else {
+      for (int64_t j = 0; !need_assign && j < spec.deps_.count(); ++j) {
+        if (spec.deps_.at(j) == assigned_expr->get_column_name()) {
+          need_assign = true;
+        }
+      }
     }
   }
   return ret;

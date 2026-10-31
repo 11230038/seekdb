@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include "lib/string/ob_sql_string.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
@@ -344,6 +345,142 @@ int ObAlterTableResolver::check_alter_column_schemas_valid(ObAlterTableStmt &stm
   return ret;
 }
 
+namespace {
+// Identifier characters of the retry predicate: everything else (operators,
+// parentheses, whitespace) is copied verbatim. Bytes of multi byte characters
+// are treated as identifier characters so that names are never split.
+bool is_retry_predicate_name_char(const char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9') || '_' == c || '$' == c
+      || (static_cast<unsigned char>(c) >= 0x80);
+}
+
+bool is_retry_predicate_space(const char c)
+{
+  return ' ' == c || '\t' == c || '\n' == c || '\r' == c;
+}
+} // namespace
+
+// STATUS is a pseudo column of the retry predicate: it reports READY or
+// FAILED for the targeted AI column. It is recognized only when it appears as
+// a bare identifier, so a backticked (or qualified) STATUS still addresses the
+// physical column of the table.
+int ObAlterTableResolver::rewrite_ai_column_retry_predicate(
+    const common::ObString &predicate,
+    const common::ObString &ai_column_name,
+    common::ObString &rewritten)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString out;
+  const char *text = predicate.ptr();
+  const int64_t len = predicate.length();
+  int64_t i = 0;
+  while (OB_SUCC(ret) && i < len) {
+    const char c = text[i];
+    if ('\'' == c || '"' == c || '`' == c) {
+      // copy a quoted literal or a quoted identifier untouched
+      const char quote = c;
+      if (OB_FAIL(out.append(&c, 1))) {
+      } else {
+        ++i;
+        while (OB_SUCC(ret) && i < len) {
+          if (quote == text[i]) {
+            if (i + 1 < len && quote == text[i + 1]) {
+              // a doubled quote is an escaped quote inside the same token
+              if (OB_FAIL(out.append(text + i, 1))) {
+              } else if (OB_FAIL(out.append(text + i + 1, 1))) {
+              } else {
+                i += 2;
+              }
+            } else {
+              if (OB_FAIL(out.append(text + i, 1))) {
+              } else {
+                ++i;
+              }
+              break;
+            }
+          } else if (OB_FAIL(out.append(text + i, 1))) {
+          } else {
+            ++i;
+          }
+        }
+      }
+    } else if (is_retry_predicate_name_char(c)) {
+      const int64_t start = i;
+      while (i < len && is_retry_predicate_name_char(text[i])) {
+        ++i;
+      }
+      const int64_t word_len = i - start;
+      int64_t prev = start - 1;
+      while (prev >= 0 && is_retry_predicate_space(text[prev])) {
+        --prev;
+      }
+      const bool qualified = prev >= 0 && '.' == text[prev];
+      if (!qualified && 6 == word_len && 0 == strncasecmp(text + start, "status", 6)) {
+        if (OB_FAIL(out.append_fmt("(case when `%.*s` is null then 'FAILED' else 'READY' end)",
+                                   ai_column_name.length(), ai_column_name.ptr()))) {
+        }
+      } else if (OB_FAIL(out.append(text + start, word_len))) {
+      }
+    } else if (OB_FAIL(out.append(&c, 1))) {
+    } else {
+      ++i;
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_, out.string(), rewritten))) {
+    SQL_RESV_LOG(WARN, "copy ai column retry predicate failed", K(ret));
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_ai_column_retry(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const share::schema::ObColumnSchemaV2 *column_schema = NULL;
+  ObString column_name;
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_)
+      || OB_ISNULL(node.children_) || 2 != node.num_child_
+      || OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid ai column retry parse tree", K(ret));
+  } else if (OB_ISNULL(node.children_[0]->str_value_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "ai column retry column name is null", K(ret));
+  } else {
+    column_name.assign_ptr(node.children_[0]->str_value_,
+                           static_cast<int32_t>(node.children_[0]->str_len_));
+    column_schema = table_schema_->get_column_schema(column_name);
+    if (OB_ISNULL(column_schema)) {
+      ObString scope_name = "AI COLUMN RETRY";
+      ret = OB_ERR_BAD_FIELD_ERROR;
+      LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, column_name.length(), column_name.ptr(),
+                     scope_name.length(), scope_name.ptr());
+    } else if (!column_schema->is_ai_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObString copied_column;
+    ObString copied_predicate;
+    const ObString predicate = (NULL != node.str_value_ && node.str_len_ > 0)
+        ? ObString(node.str_len_, node.str_value_) : ObString();
+    if (OB_FAIL(ob_write_string(*allocator_, column_name, copied_column))) {
+      SQL_RESV_LOG(WARN, "copy ai column retry column name failed", K(ret));
+    } else if (!predicate.empty()
+               && OB_FAIL(rewrite_ai_column_retry_predicate(predicate, column_name,
+                                                            copied_predicate))) {
+    } else {
+      alter_table_stmt->set_ai_retry_predicate(copied_predicate);
+      alter_table_stmt->set_ai_retry_column(copied_column);
+      alter_table_stmt->set_is_ai_column_retry(true);
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
@@ -393,6 +530,28 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
     bool has_alter_partition = false;
     //in mysql mode, resolve add index after resolve column actions
     ObSEArray<int64_t, 4> add_index_action_idxs;
+    // AI COLUMN RETRY is a self contained action which may not be combined
+    // with any other action of the same ALTER TABLE statement.
+    int64_t ai_retry_count = 0;
+    const ParseNode *ai_retry_node = NULL;
+    for (int64_t i = 0; i < node.num_child_; ++i) {
+      if (NULL != node.children_[i] && T_AI_COLUMN_RETRY == node.children_[i]->type_) {
+        ++ai_retry_count;
+        ai_retry_node = node.children_[i];
+      }
+    }
+    if (ai_retry_count > 0) {
+      if (node.num_child_ > 1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "combining AI COLUMN RETRY with another ALTER action");
+      } else if (OB_ISNULL(ai_retry_node)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "ai column retry action is null", K(ret));
+      } else if (OB_FAIL(resolve_ai_column_retry(*ai_retry_node))) {
+      }
+      return ret;
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
       ParseNode *action_node = node.children_[i];
       if (OB_ISNULL(action_node)) {

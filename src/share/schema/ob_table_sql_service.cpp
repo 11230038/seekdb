@@ -3170,7 +3170,10 @@ int ObTableSqlService::gen_column_dml_without_check(
       cur_default_value.reset();
     }
     ObString bin_extended_type_info;
-    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection())) {
+    // AI column specs (function, model, prompt, dependencies, ...) are kept in
+    // the extended type info as well, so it must be persisted for them too.
+    if (OB_SUCC(ret)
+        && (column.is_enum_or_set() || column.is_collection() || column.is_ai_column())) {
       int64_t pos = 0;
       extended_type_info_buf = static_cast<char *>(allocator.alloc(OB_MAX_VARBINARY_LENGTH));
       if (OB_ISNULL(extended_type_info_buf)) {

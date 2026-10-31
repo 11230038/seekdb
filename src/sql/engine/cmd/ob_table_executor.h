@@ -195,6 +195,10 @@ private:
   int refresh_schema_for_table();
   int populate_based_schema_obj_info_(obcall::ObAlterTableArg &alter_table_arg);
 
+  // ALTER TABLE ... RETRY AI COLUMN ... is executed as the UPDATE which clears
+  // the AI column of the matching rows.
+  int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt);
+
 private:
   //DISALLOW_COPY_AND_ASSIGN(ObAlterTableExecutor);
 };

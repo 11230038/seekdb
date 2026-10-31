@@ -21,6 +21,12 @@
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "lib/string/ob_sql_string.h"
+#include "lib/time/ob_time_utility.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_schema_struct.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/schema/ob_ai_column_util.h"
 
 namespace oceanbase
 {
@@ -1012,6 +1018,201 @@ int ObTableModifyOp::execute_read(const char *sql, ObMySQLProxy::MySQLResult &re
  return ret;
 }
 
+int ObTableModifyOp::ai_column_task_sync()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  ObSqlCtx *sql_ctx = ctx_.get_sql_ctx();
+  ObSchemaGetterGuard *schema_guard = NULL;
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  ObSEArray<const ObColumnSchemaV2 *, 4> ai_columns;
+  ObTableID table_loc_id = OB_INVALID_ID;
+  ObTableID ref_table_id = OB_INVALID_ID;
+
+  if (OB_ISNULL(session) || OB_ISNULL(sql_ctx)
+      || OB_ISNULL(schema_guard = sql_ctx->schema_guard_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("session or schema guard is null", K(ret));
+  } else if (ObSQLUtils::is_ai_column_sync_sql(&ctx_)) {
+    // the nested statements issued by the AI column synchronization below
+    // must not synchronize AI columns again, otherwise they would recurse
+    LOG_DEBUG("skip ai column task sync for nested ai column sql");
+  } else if (OB_FAIL(MY_SPEC.get_single_table_loc_id(table_loc_id, ref_table_id))) {
+    // AI column tasks are only maintained by single table DML
+    ret = OB_SUCCESS;
+  } else if (OB_FAIL(schema_guard->get_table_schema(ref_table_id, table_schema))) {
+    LOG_WARN("get table schema failed", K(ret), K(ref_table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table schema is null", K(ret), K(ref_table_id));
+  } else if (!table_schema->is_user_table()) {
+    // the operator maintains an index, the AI column lives on the main table
+  } else {
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("column schema is null", K(ret));
+      } else if (column->is_ai_column() && OB_FAIL(ai_columns.push_back(column))) {
+        LOG_WARN("save ai column schema failed", K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && !ai_columns.empty()) {
+    if (OB_FAIL(schema_guard->get_database_schema(
+                  table_schema->get_database_id(), db_schema))) {
+      LOG_WARN("get database schema failed", K(ret), K(table_schema->get_database_id()));
+    } else if (OB_ISNULL(db_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("database schema is null", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !ai_columns.empty()) {
+    ObSEArray<uint64_t, 4> rowkey_ids;
+    ObSqlString qualified_table;
+    ObSqlString pred_expr;
+    ObSqlString sql;
+    const ObString db_name = db_schema->get_database_name_str();
+    const ObString table_name = table_schema->get_table_name_str();
+    // Every statement uses a fresh request id, shared by all tasks it
+    // creates. A result computed for an older request can therefore be
+    // recognized as stale by the worker and discarded.
+    static int64_t request_seq = 0;
+    const int64_t request_id =
+        ObTimeUtility::current_time() * 1000 + ATOMIC_AAF(&request_seq, 1) % 1000;
+    bool nested_begun = false;
+
+    if (OB_FAIL(qualified_table.append_fmt("`%.*s`.`%.*s`",
+                                           db_name.length(), db_name.ptr(),
+                                           table_name.length(), table_name.ptr()))) {
+      LOG_WARN("build qualified table name failed", K(ret));
+    } else if (OB_FAIL(table_schema->get_rowkey_column_ids(rowkey_ids))) {
+      LOG_WARN("get rowkey column ids failed", K(ret));
+    } else if (rowkey_ids.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("rowkey of the table is empty", K(ret));
+    } else if (OB_FAIL(pred_expr.append("concat("))) {
+      LOG_WARN("build rowkey predicate failed", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+      const ObColumnSchemaV2 *key_column =
+          table_schema->get_column_schema(rowkey_ids.at(i));
+      if (OB_ISNULL(key_column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("rowkey column schema is null", K(ret), K(rowkey_ids.at(i)));
+      } else {
+        const ObString key_name = key_column->get_column_name_str();
+        if (i > 0 && OB_FAIL(pred_expr.append(", "))) {
+        } else if (OB_FAIL(pred_expr.append_fmt("'`%.*s` = '",
+                                                key_name.length(), key_name.ptr()))) {
+        } else if (OB_FAIL(pred_expr.append(", "))) {
+        } else if (ob_is_numeric_type(key_column->get_data_type())) {
+          if (OB_FAIL(pred_expr.append_fmt("`%.*s`",
+                                           key_name.length(), key_name.ptr()))) {
+          }
+        } else if (OB_FAIL(pred_expr.append_fmt("quote(`%.*s`)",
+                                                key_name.length(), key_name.ptr()))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(pred_expr.append(")"))) {
+      LOG_WARN("build rowkey predicate failed", K(ret));
+    }
+
+    // the SQL below is executed on behalf of the current DML, mark it as a
+    // nested statement so that it joins the current transaction as a whole
+    const bool saved_ai_column_sync = ctx_.is_ai_column_sync();
+    ctx_.set_is_ai_column_sync(true);
+    if (OB_SUCC(ret)) {
+      if (NULL == inner_conn_ && OB_FAIL(open_inner_conn())) {
+        LOG_WARN("open inner connection failed", K(ret));
+      } else if (OB_FAIL(begin_nested_session(true))) {
+        LOG_WARN("begin nested session failed", K(ret));
+      } else {
+        nested_begun = true;
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+      const ObColumnSchemaV2 *ai_column = ai_columns.at(i);
+      const ObString ai_name = ai_column->get_column_name_str();
+      const int64_t table_id = static_cast<int64_t>(table_schema->get_table_id());
+      const int64_t column_id = static_cast<int64_t>(ai_column->get_column_id());
+      // 1. drop every task of the rows which still exist, so that a row whose
+      //    AI column is recomputed gets a fresh request id, and a row whose
+      //    value was written by the user no longer waits for a result
+      if (OB_FAIL(sql.assign_fmt(
+            "delete from oceanbase.__all_ai_column_task"
+            " where table_id = %ld and column_id = %ld"
+            " and rowkey_predicate in"
+            " (select %.*s from %.*s)",
+            table_id, column_id,
+            static_cast<int>(pred_expr.length()), pred_expr.ptr(),
+            static_cast<int>(qualified_table.length()), qualified_table.ptr(),
+            ai_name.length(), ai_name.ptr()))) {
+      } else if (OB_FAIL(execute_write(sql.ptr()))) {
+        LOG_WARN("delete stale ai column task failed", K(ret), K(sql));
+      }
+      // 2. register a task for every row which has no result yet
+      if (OB_SUCC(ret) && OB_FAIL(sql.assign_fmt(
+            "insert into oceanbase.__all_ai_column_task"
+            "(table_id, column_id, rowkey_predicate, request_id,"
+            " state, retry_count, eligible_ts)"
+            " select %ld, %ld, %.*s, %ld, 0, 0, now(6) from %.*s"
+            " where `%.*s` is null",
+            table_id, column_id,
+            static_cast<int>(pred_expr.length()), pred_expr.ptr(),
+            request_id,
+            static_cast<int>(qualified_table.length()), qualified_table.ptr(),
+            ai_name.length(), ai_name.ptr()))) {
+      } else if (OB_FAIL(execute_write(sql.ptr()))) {
+        LOG_WARN("create ai column task failed", K(ret), K(sql));
+      }
+      // 3. rewrite the invalidated AI column for the rows which just got a
+      //    task. The value is already NULL, so the data does not change; the
+      //    rewrite records the invalidation as its own vector index version
+      //    in the current transaction.
+      if (OB_SUCC(ret) && OB_FAIL(sql.assign_fmt(
+            "update %.*s set `%.*s` = NULL where %.*s in"
+            " (select rowkey_predicate from oceanbase.__all_ai_column_task"
+            " where table_id = %ld and column_id = %ld and request_id = %ld)",
+            static_cast<int>(qualified_table.length()), qualified_table.ptr(),
+            ai_name.length(), ai_name.ptr(),
+            static_cast<int>(pred_expr.length()), pred_expr.ptr(),
+            table_id, column_id, request_id))) {
+        LOG_WARN("build ai column invalidation sql failed", K(ret));
+      } else if (OB_SUCC(ret) && OB_FAIL(execute_write(sql.ptr()))) {
+        LOG_WARN("invalidate ai column again failed", K(ret), K(sql));
+      }
+      // 4. drop the tasks of the rows which no longer exist
+      if (OB_SUCC(ret) && OB_FAIL(sql.assign_fmt(
+            "delete from oceanbase.__all_ai_column_task"
+            " where table_id = %ld and column_id = %ld"
+            " and rowkey_predicate not in (select %.*s from %.*s)",
+            table_id, column_id,
+            static_cast<int>(pred_expr.length()), pred_expr.ptr(),
+            static_cast<int>(qualified_table.length()), qualified_table.ptr()))) {
+      } else if (OB_SUCC(ret) && OB_FAIL(execute_write(sql.ptr()))) {
+        LOG_WARN("delete obsolete ai column task failed", K(ret), K(sql));
+      }
+    }
+    if (nested_begun) {
+      const int tmp_ret = end_nested_session();
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN("end nested session failed", K(tmp_ret));
+        if (OB_SUCC(ret)) {
+          ret = tmp_ret;
+        }
+      }
+    }
+    ctx_.set_is_ai_column_sync(saved_ai_column_sync);
+  }
+  return ret;
+}
+
 int ObTableModifyOp::check_stack()
 {
   int ret = OB_SUCCESS;
@@ -1133,6 +1334,10 @@ int ObTableModifyOp::inner_get_next_row()
     }
     //to post process the DML info after writing all data to the storage or returning one row
     ret = write_rows_post_proc(ret);
+    if (OB_SUCC(ret) && iter_end_) {
+      if (OB_FAIL(ai_column_task_sync())) {
+      }
+    }
     if (OB_SUCC(ret) && iter_end_) {
       ret = OB_ITER_END;
     }

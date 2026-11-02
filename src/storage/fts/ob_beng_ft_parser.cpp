@@ -49,6 +49,15 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (token_buffer_pos_ + token.len_ <= token_buffer_capacity_) {
+    buf = token_buffer_ + token_buffer_pos_;
+    MEMCPY(buf, token.ptr_, token.len_);
+    token_buffer_pos_ += token.len_;
+    word = buf;
+    word_len = token.len_;
+    char_len = token.len_;
+    word_freq = token_freq;
+    LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
   } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
@@ -76,7 +85,10 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     analysis_ctx_.cs_ = param->cs_;
     analysis_ctx_.filter_stopword_ = false;
     analysis_ctx_.need_grouping_ = false;
-    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
+    token_buffer_capacity_ = param->ft_length_;
+    if (OB_ISNULL(token_buffer_ = static_cast<char *>(allocator_.alloc(token_buffer_capacity_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
     } else if (OB_FAIL(segment(doc_, token_stream_))) {
     } else if (OB_ISNULL(token_stream_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -110,6 +122,12 @@ void ObBEngFTParser::reset()
   english_analyzer_.reset();
   doc_.reset();
   token_stream_ = nullptr;
+  if (OB_NOT_NULL(token_buffer_)) {
+    allocator_.free(token_buffer_);
+    token_buffer_ = nullptr;
+  }
+  token_buffer_capacity_ = 0;
+  token_buffer_pos_ = 0;
   is_inited_ = false;
 }
 

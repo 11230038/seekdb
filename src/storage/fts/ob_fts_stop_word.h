@@ -119,6 +119,16 @@ public:
       K(word_map_.size()));
 
 private:
+  struct AddWordCount
+  {
+    explicit AddWordCount(const int64_t word_freq) : word_freq_(word_freq) {}
+    void operator()(common::hash::HashMapPair<ObFTWord, int64_t> &pair)
+    {
+      pair.second += word_freq_;
+    }
+    int64_t word_freq_;
+  };
+
   bool is_min_max_word(const int64_t c_len) const;
   int casedown_word(const ObFTWord &src, ObFTWord &dst);
   int check_stopword(const ObFTWord &word, bool &is_stopword);

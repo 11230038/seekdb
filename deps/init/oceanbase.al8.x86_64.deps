@@ -1,4 +1,4 @@
-[target-default]
+ [target-default]
 os=8
 arch=x86_64
 repo=https://mirrors.oceanbase.com/oceanbase/development-kit/al/8/x86_64/

@@ -156,7 +156,8 @@ int ObIKTokenChain::copy(ObIKTokenChain *other)
 
   if (OB_ISNULL(other)) {
     ret = OB_INVALID_ARGUMENT;
-  } else {
+  } else if (this != other) {
+    list_.reset();
     min_offset_ = other->min_offset_;
     max_offset_ = other->max_offset_;
     payload_ = other->payload_;

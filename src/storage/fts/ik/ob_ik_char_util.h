@@ -386,14 +386,18 @@ inline int ObFTCharUtil::check_num_connector(ObCollationType coll_type,
   int ret = OB_SUCCESS;
   ObCharsetType cs_type = ObCharset::charset_type_by_coll(coll_type);
 
-  switch (cs_type) {
-  case CHARSET_UTF8MB4: {
-    ret = ObFTCharUtil::is_num_connector<CHARSET_UTF8MB4>(input, char_len, is_connector);
-    break;
-  }
-  default:
-    ret = OB_NOT_SUPPORTED;
-    STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+  if (CHARSET_UTF8MB4 == cs_type && 1 == char_len && OB_NOT_NULL(input)) {
+    is_connector = ',' == input[0] || '.' == input[0];
+  } else {
+    switch (cs_type) {
+    case CHARSET_UTF8MB4: {
+      ret = ObFTCharUtil::is_num_connector<CHARSET_UTF8MB4>(input, char_len, is_connector);
+      break;
+    }
+    default:
+      ret = OB_NOT_SUPPORTED;
+      STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+    }
   }
   return ret;
 }
@@ -406,16 +410,20 @@ inline int ObFTCharUtil::check_letter_connector(ObCollationType coll_type,
   int ret = OB_SUCCESS;
   ObCharsetType cs_type = ObCharset::charset_type_by_coll(coll_type);
 
-  switch (cs_type) {
-  case CHARSET_UTF8MB4: {
-    // ret = ObFTCharUtil::do_check_letter_connector<CHARSET_UTF8MB4>(input, char_len,
-    // is_connector);
-    ret = ObFTCharUtil::is_letter_connector<CHARSET_UTF8MB4>(input, char_len, is_connector);
-    break;
-  }
-  default:
-    ret = OB_NOT_SUPPORTED;
-    STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+  if (CHARSET_UTF8MB4 == cs_type && 1 == char_len && OB_NOT_NULL(input)) {
+    const char ch = input[0];
+    is_connector = '#' == ch || '&' == ch || '+' == ch || '-' == ch || '.' == ch || '@' == ch
+                   || '_' == ch;
+  } else {
+    switch (cs_type) {
+    case CHARSET_UTF8MB4: {
+      ret = ObFTCharUtil::is_letter_connector<CHARSET_UTF8MB4>(input, char_len, is_connector);
+      break;
+    }
+    default:
+      ret = OB_NOT_SUPPORTED;
+      STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+    }
   }
   return ret;
 }
@@ -445,26 +453,30 @@ template <ObCharsetType CS_TYPE>
 inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, CharType &type)
 {
   int ret = OB_SUCCESS;
-  bool checker = false;
+  ob_wc_t unicode = 0;
   type = CharType::USELESS;
 
-  if (OB_FAIL(is_alpha<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  if (CS_TYPE == CHARSET_UTF8MB4 && 1 == char_len && OB_NOT_NULL(input)) {
+    const unsigned char ch = static_cast<unsigned char>(input[0]);
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+      type = CharType::ENGLISH_LETTER;
+    } else if (ch >= '0' && ch <= '9') {
+      type = CharType::ARABIC_LETTER;
+    }
+  } else if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
+  } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
     type = CharType::ENGLISH_LETTER;
-  } else if (OB_FAIL(is_arabic<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
     type = CharType::ARABIC_LETTER;
-  } else if (OB_FAIL(is_chinese<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
     type = CharType::CHINESE;
-  } else if (OB_FAIL(is_other_cjk<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
     type = CharType::OTHER_CJK;
-  } else if (OB_FAIL(is_surrogate_high<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
+             && ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
     type = CharType::SURROGATE_HIGH;
-  } else if (OB_FAIL(is_surrogate_low<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
+             && ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
     type = CharType::SURROGATE_LOW;
   }
   return ret;

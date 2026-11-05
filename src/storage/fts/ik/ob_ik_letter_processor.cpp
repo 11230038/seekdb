@@ -37,9 +37,14 @@ int ObIKLetterProcessor::do_process(TokenizeContext &ctx,
                                     const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(process_english_letter(ctx, ch, char_len, type))) {
-  } else if (OB_FAIL(process_arabic_letter(ctx, ch, char_len, type))) {
-  } else if (OB_FAIL(process_mix_letter(ctx, ch, char_len, type))) {
+  const bool is_english = ObFTCharUtil::CharType::ENGLISH_LETTER == type;
+  const bool is_arabic = ObFTCharUtil::CharType::ARABIC_LETTER == type;
+  if ((is_english || -1 != english_start_)
+      && OB_FAIL(process_english_letter(ctx, ch, char_len, type))) {
+  } else if ((is_arabic || -1 != arabic_start_)
+             && OB_FAIL(process_arabic_letter(ctx, ch, char_len, type))) {
+  } else if ((is_english || is_arabic || -1 != mix_start_)
+             && OB_FAIL(process_mix_letter(ctx, ch, char_len, type))) {
   }
   return ret;
 }
@@ -110,8 +115,11 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
     arabic_char_cnt_ += arabic_connect_cnt_;
     arabic_char_cnt_++;
     arabic_connect_cnt_ = 0;
-  } else if (OB_FAIL(
-                 ObFTCharUtil::check_num_connector(ctx.collation(), ch, char_len, is_connector))) {
+  } else if (ObFTCharUtil::CharType::USELESS == type
+             && OB_FAIL(ObFTCharUtil::check_num_connector(ctx.collation(),
+                                                          ch,
+                                                          char_len,
+                                                          is_connector))) {
   } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
     // only if connector follows  and is followed by an arabic number we count it
     arabic_connect_cnt_++;
@@ -168,10 +176,11 @@ int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
     if (is_mix_char) {
       mix_end_ = ctx.get_end_cursor();
       this->mix_char_cnt_++;
-    } else if (OB_FAIL(ObFTCharUtil::check_letter_connector(ctx.collation(),
-                                                            ch,
-                                                            char_len,
-                                                            is_connector))) {
+    } else if (ObFTCharUtil::CharType::USELESS == type
+               && OB_FAIL(ObFTCharUtil::check_letter_connector(ctx.collation(),
+                                                               ch,
+                                                               char_len,
+                                                               is_connector))) {
     } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
       this->mix_end_ = ctx.get_end_cursor();
       this->mix_char_cnt_++;

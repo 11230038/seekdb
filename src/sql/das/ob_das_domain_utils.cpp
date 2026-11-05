@@ -100,7 +100,6 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
   } else {
     row_idx_ = 0;
   }
-  LOG_TRACE("word segment", K(ret), K(row_idx_), K(rows_.count()), K(doc_id_datum), K(fulltext));
   return ret;
 }
 
@@ -115,7 +114,6 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
     row = (rows_[row_idx_]);
     ++row_idx_;
   }
-  LOG_TRACE("get next row", K(ret), KPC(row), K(row_idx_), K(rows_.count()));
   return ret;
 }
 
@@ -362,7 +360,6 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
   } else if (OB_FAIL(helper->segment(meta, fulltext.ptr(), fulltext.length(), doc_length, words_count))) {
   }
 
-  STORAGE_FTS_LOG(TRACE, "segment and calc word count", K(ret), K(words_count.size()), K(type));
   return ret;
 }
 

@@ -127,8 +127,6 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     if (OB_SUCC(ret)) {
       next_token.set_string(curr_token_ptr_, static_cast<uint32_t>(token_len));
       token_freq = 1;
-      LOG_DEBUG("[TEXT ANALYSIS] got next token", K(ret), K(next_token), K(next_token.get_string()),
-          K(input_doc_->len_), K_(trav_pos));
     }
   }
   return ret;

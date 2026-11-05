@@ -103,7 +103,6 @@ int ObFTDocWordScanIterator::do_table_rescan()
 #ifdef OB_BUILD_PACKAGE
   LOG_TRACE("doc word rescan", K(ret), K(scan_param_));
 #else
-  LOG_INFO("doc word rescan", K(ret), K(scan_param_));
 #endif
   return ret;
 }
@@ -274,7 +273,6 @@ int ObFTDocWordScanIterator::do_table_scan()
 #ifdef OB_BUILD_PACKAGE
   LOG_TRACE("doc word scan", K(ret), K(scan_param_));
 #else
-  LOG_INFO("doc word scan", K(ret), K(scan_param_));
 #endif
   return ret;
 }

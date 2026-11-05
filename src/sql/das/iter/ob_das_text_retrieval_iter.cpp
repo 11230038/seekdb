@@ -329,9 +329,6 @@ int ObDASTextRetrievalIter::inner_get_next_row()
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
   } else {
-    LOG_DEBUG("get one invert index scan row", "row",
-        ROWEXPR2STR(*ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_,
-        *inv_idx_scan_param_.output_exprs_));
     if (ir_ctdef_->need_calc_relevance()) {
       clear_row_wise_evaluated_flag();
       if (OB_FAIL(fill_token_doc_cnt())) {
@@ -374,7 +371,6 @@ int ObDASTextRetrievalIter::inner_get_next_rows(int64_t &count, int64_t capacity
     if (ir_ctdef_->need_calc_relevance()) {
       sql::ObEvalCtx *ctx = ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_;
       const ObBitVector *skip = NULL;
-      PRINT_VECTORIZED_ROWS(SQL, DEBUG, *ctx, *inv_idx_scan_param_.output_exprs_, count, skip);
       clear_batch_wise_evaluated_flag(count);
       if (OB_FAIL(fill_token_doc_cnt())) {
       } else if (OB_FAIL(fill_token_weight())) {

@@ -58,7 +58,7 @@ private:
     static constexpr const char *ADDITIONAL_ARGS_STR = "additional_args";
 
   public:
-    TokenizeParam();
+    explicit TokenizeParam(common::ObIAllocator &allocator);
 
     int parse_json_param(const ObIJsonBase *obj);
 
@@ -67,8 +67,8 @@ private:
     int try_load_dictionary_for_ik();
 
   public:
-    // for property and tmp json string
-    mutable ObArenaAllocator allocator_;
+    // for property and temporary JSON strings
+    common::ObIAllocator &allocator_;
     ObString parser_name_;
     ObString properties_;
     ObObjMeta meta_;

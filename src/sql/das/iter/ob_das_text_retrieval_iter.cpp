@@ -700,14 +700,20 @@ int ObDASTRCacheIter::inner_init(ObDASIterParam &param)
   } else {
     is_inited_ = false;
     const int64_t default_size = OB_MAX(max_batch_size_, 1);
-    relevance_.set_allocator(&allocator_);
-    if (OB_FAIL(relevance_.init(default_size))) {
-    } else if (OB_FAIL(relevance_.prepare_allocate(default_size))) {
-    } else if (FALSE_IT(doc_id_.set_allocator(&allocator_))) {
-    } else if (OB_FAIL(doc_id_.init(default_size))) {
-    } else if (OB_FAIL(doc_id_.prepare_allocate(default_size))) {
-    } else {
-      is_inited_ = true;
+    const bool need_relevance = ir_ctdef_->need_calc_relevance();
+    if (need_relevance) {
+      relevance_.set_allocator(&allocator_);
+      if (OB_FAIL(relevance_.init(default_size))) {
+      } else if (OB_FAIL(relevance_.prepare_allocate(default_size))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      doc_id_.set_allocator(&allocator_);
+      if (OB_FAIL(doc_id_.init(default_size))) {
+      } else if (OB_FAIL(doc_id_.prepare_allocate(default_size))) {
+      } else {
+        is_inited_ = true;
+      }
     }
   }
   return ret;
@@ -722,12 +728,15 @@ int ObDASTRCacheIter::inner_reuse()
   int64_t old_default_size = OB_MAX(max_batch_size_, 1);
   max_batch_size_ = ir_rtdef_->eval_ctx_->max_batch_size_;
   if (old_default_size < OB_MAX(max_batch_size_, 1)) {
-    relevance_.reuse();
+    const bool need_relevance = ir_ctdef_->need_calc_relevance();
+    if (need_relevance) {
+      relevance_.reuse();
+    }
     doc_id_.reuse();
     const int64_t default_size = OB_MAX(max_batch_size_, 1);
     allocator_.reuse();
-    if (OB_FAIL(relevance_.init(default_size))) {
-    } else if (OB_FAIL(relevance_.prepare_allocate(default_size))) {
+    if (need_relevance && OB_FAIL(relevance_.init(default_size))) {
+    } else if (need_relevance && OB_FAIL(relevance_.prepare_allocate(default_size))) {
     } else if (OB_FAIL(doc_id_.init(default_size))) {
     } else if (OB_FAIL(doc_id_.prepare_allocate(default_size))) {
     } else if (OB_ISNULL(skip_ = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(default_size))))) {
@@ -866,6 +875,11 @@ int ObDASTRCacheIter::get_cur_row(double &relevance, ObDocIdExt &doc_id) const
     // once: relevance_[cur_idx_],doc_id_[cur_idx_]=>item{relevance,doc_id}. tiwce: item=>losetree
     if (ir_ctdef_->need_calc_relevance()) {
       relevance = relevance_[cur_idx_];
+    } else {
+      // Boolean evaluation only needs token presence when the score itself is
+      // not consumed.  A positive sentinel preserves that meaning without
+      // building BM25 inputs.
+      relevance = 1.0;
     }
     doc_id = doc_id_[cur_idx_];
   }

@@ -1918,6 +1918,8 @@ int ObDASTRDaatIter::fill_loser_tree_item(
     ObExpr *relevance_expr = ir_ctdef_->relevance_expr_;
     const ObDatum &relevance_datum = relevance_expr->locate_expr_datum(*ir_rtdef_->eval_ctx_);
     item.relevance_ = relevance_datum.get_double();
+  } else {
+    item.relevance_ = 1.0;
   }
   return ret;
 }
@@ -1925,6 +1927,7 @@ int ObDASTRDaatIter::fill_loser_tree_item(
 int ObDASTRDaatIter::next_disjunctive_document(const bool is_batch, bool &doc_valid)
 {
   int ret = OB_SUCCESS;
+  const bool need_relevance = ir_ctdef_->need_calc_relevance();
   int64_t doc_cnt = 0;
   bool curr_doc_end = false;
   const ObIRIterLoserTreeItem *top_item = nullptr;
@@ -1945,7 +1948,7 @@ int ObDASTRDaatIter::next_disjunctive_document(const bool is_batch, bool &doc_va
       next_batch_iter_idxes_[next_batch_cnt_++] = top_item->iter_idx_;
       if (BOOLEAN == relation_type_) {
         boolean_relevances_[top_item->iter_idx_] = top_item->relevance_;
-      } else {
+      } else if (need_relevance) {
         // consider to add an expr for collectiong conjunction result between query tokens here?
         cur_doc_relevance += top_item->relevance_;
       }
@@ -1964,7 +1967,7 @@ int ObDASTRDaatIter::next_disjunctive_document(const bool is_batch, bool &doc_va
   }
 
   if (OB_SUCC(ret) && doc_valid) {
-    const double relevance_score = ir_ctdef_->need_calc_relevance() ? cur_doc_relevance : 1;
+    const double relevance_score = need_relevance ? cur_doc_relevance : 1;
     if (!is_batch && OB_FAIL(project_result(iter_doc_ids_[top_item->iter_idx_], relevance_score))) {
     } else if (is_batch && OB_FAIL(project_relevance(iter_doc_ids_[top_item->iter_idx_], relevance_score))) {
     }
@@ -2158,6 +2161,7 @@ int ObDASTRDaatLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
 int ObDASTRDaatLookupIter::next_disjunctive_document(const int capacity)
 {
   int ret = OB_SUCCESS;
+  const bool need_relevance = ir_ctdef_->need_calc_relevance();
   const ObIRIterLoserTreeItem *top_item = nullptr;
   ObEvalCtx *ctx = ir_rtdef_->eval_ctx_;
   if (!iter_row_heap_->empty()) {
@@ -2196,7 +2200,7 @@ int ObDASTRDaatLookupIter::next_disjunctive_document(const int capacity)
           next_batch_iter_idxes_[next_batch_cnt_++] = top_item->iter_idx_;
           if (BOOLEAN == relation_type_) {
             boolean_relevances_[top_item->iter_idx_] = top_item->relevance_;
-          } else {
+          } else if (need_relevance) {
             // consider to add an expr for collectiong conjunction result between query tokens here?
             cur_doc_relevance += top_item->relevance_;
           }
@@ -2215,7 +2219,7 @@ int ObDASTRDaatLookupIter::next_disjunctive_document(const int capacity)
       }
 
       if (OB_SUCC(ret)) {
-        const double relevance_score = ir_ctdef_->need_calc_relevance() ? cur_doc_relevance : 0;
+        const double relevance_score = need_relevance ? cur_doc_relevance : 0;
         int64_t pos = hints_[next_written_idx_];
         if (pos < capacity) {
           ObEvalCtx::BatchInfoScopeGuard guard(*ctx);

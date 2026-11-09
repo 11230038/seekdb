@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -107,6 +108,26 @@ float l2_square(const float *lhs, const float *rhs, int64_t dim)
   return sum;
 }
 
+// The DDL build path calls append() once per row. Rebuilding the CAGRA graph on
+// every call would be quadratic, while never rebuilding would leave the GPU
+// idle for the entire construction. The delta is folded into the base array and
+// the graph rebuilt once it reaches max(this floor, current base), which
+// doubles the threshold after every fold and keeps the total amount of GPU
+// build work linear in the dataset size (below 2x the final row count). The
+// floor is small enough that an ordinary benchmark - a few thousand rows -
+// already builds its graph on the GPU during CREATE VECTOR INDEX, and small
+// enough that the rebuild is cheap, while tiny tables stay on the exact host
+// scan instead of paying for a graph of a few hundred nodes.
+constexpr int64_t kMinFoldDelta = 4096;
+
+// Doubles a requested capacity so that repeated one row appends do not copy the
+// buffered vectors on every call.
+size_t grown_capacity(int64_t needed)
+{
+  const int64_t limit = std::numeric_limits<int64_t>::max() / 2;
+  return static_cast<size_t>(needed <= limit ? needed * 2 : needed);
+}
+
 template <typename T>
 void append_pod(std::vector<char> &out, const T &value)
 {
@@ -162,12 +183,18 @@ struct ObHipvsIndex::Impl
   Impl() = default;
 
   bool build_gpu(int device_id);
+  // Moves every pending delta row into the base arrays and rebuilds the CAGRA
+  // graph. Returns false when the rebuild failed; the previous base arrays and
+  // the delta are restored so that queries keep working from the old graph and
+  // the host scan of the delta.
+  bool fold_delta_and_rebuild();
   int search_gpu(const float *queries,
                  int64_t query_count,
                  int64_t k,
                  int64_t itopk,
                  int64_t *out_ids,
                  float *out_distances) const;
+  bool has_gpu_graph() const;
 
   int64_t dim_ = 0;
   int64_t base_count_ = 0;
@@ -186,12 +213,20 @@ struct ObHipvsIndex::Impl
   mutable std::shared_mutex rw_mutex_;
 
 #ifdef OB_ENABLE_HIPVS
-  std::unique_ptr<detail::RaftResources> res_;
   // cuVS/hipVS instantiate CAGRA with a 32-bit vertex id type. The dataset rows
   // are translated back to the caller's 64-bit vector ids on the host.
   std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> index_;
 #endif
 };
+
+bool ObHipvsIndex::Impl::has_gpu_graph() const
+{
+#ifdef OB_ENABLE_HIPVS
+  return index_ != nullptr;
+#else
+  return false;
+#endif
+}
 
 ObHipvsIndex::ObHipvsIndex() : impl_(new Impl())
 {
@@ -209,6 +244,14 @@ bool ObHipvsIndex::is_available()
   const int forced = g_forced_available.load();
   if (forced >= 0) {
     return forced == 1;
+  }
+  // Escape hatch: OB_HIPVS_DISABLE=1 forces the vsag fallback on a GPU host.
+  // It is used to benchmark the CPU path and to isolate GPU problems without
+  // rebuilding or changing the index DDL.
+  const char *disabled = ::getenv("OB_HIPVS_DISABLE");
+  if (disabled != nullptr && disabled[0] != '\0' && 0 != strcmp(disabled, "0")) {
+    set_error("hipVS is disabled by OB_HIPVS_DISABLE");
+    return false;
   }
   int cached = g_available.load();
   if (cached < 0) {
@@ -247,6 +290,31 @@ const char *ObHipvsIndex::last_error()
 
 #ifdef OB_ENABLE_HIPVS
 
+namespace
+{
+// raft::resources owns the HIP stream, handle and workspace allocator used by
+// cuVS kernels, and is not safe to share between threads. Query threads hit
+// search() concurrently, so every thread keeps its own resources object.
+detail::RaftResources &thread_raft_resources()
+{
+  thread_local std::unique_ptr<detail::RaftResources> resources;
+  if (resources == nullptr) {
+    resources.reset(new detail::RaftResources());
+  }
+  return *resources;
+}
+
+// The CAGRA index owns device memory allocated through the resources object
+// that built it. Builds run on DDL worker threads, and those threads may exit
+// while the index is still queried, so the allocation owner must outlive every
+// thread and live until process exit.
+detail::RaftResources &index_raft_resources()
+{
+  static detail::RaftResources *resources = new detail::RaftResources();
+  return *resources;
+}
+}  // namespace
+
 bool ObHipvsIndex::Impl::build_gpu(int device_id)
 {
   bool ok = true;
@@ -263,25 +331,32 @@ bool ObHipvsIndex::Impl::build_gpu(int device_id)
       ok = false;
     }
     if (ok) {
-      res_.reset(new detail::RaftResources());
       index_.reset();
       cuvs::neighbors::cagra::index_params params;
       params.metric = cuvs::distance::DistanceType::L2Expanded;
-      params.graph_degree = static_cast<size_t>(std::max(1, graph_degree_));
-      params.intermediate_graph_degree =
-          static_cast<size_t>(std::max(graph_degree_, intermediate_graph_degree_));
+      // Small snapshots (fewer rows than the configured degree) cannot form a
+      // graph with that many neighbors; clamp to the dataset size instead of
+      // letting the CUDA/HIP build reject the parameters.
+      const int64_t degree_limit = std::max<int64_t>(1, base_count_ - 1);
+      params.graph_degree = static_cast<size_t>(
+          std::min<int64_t>(degree_limit, std::max(1, graph_degree_)));
+      params.intermediate_graph_degree = static_cast<size_t>(
+          std::min<int64_t>(degree_limit, std::max(graph_degree_, intermediate_graph_degree_)));
       // Keep the dataset attached so that the graph is self contained and can
       // be searched without an external dataset handle.
       params.attach_dataset_on_build = true;
-      // Hand the host buffer to build(). cuVS copies it to the device and the
-      // returned index owns that copy; passing a device view instead would make
-      // the index keep a non-owning reference to memory owned by this scope.
+      // Build from the host buffer. cuVS copies a host view to the device and
+      // the returned index owns that copy, so it stays valid after this
+      // function returns. Passing a device view instead would make the index
+      // keep a non-owning reference to memory owned by this scope, and every
+      // later GPU search would read freed device memory.
+      detail::RaftResources &res = index_raft_resources();
       auto built = cuvs::neighbors::cagra::build(
-          *res_, params,
+          res, params,
           raft::make_host_matrix_view<const float, int64_t, raft::row_major>(
               vectors_.data(), base_count_, dim_));
       index_.reset(new cuvs::neighbors::cagra::index<float, uint32_t>(std::move(built)));
-      const hipError_t err = hipDeviceSynchronize();
+      hipError_t err = hipDeviceSynchronize();
       if (err != hipSuccess) {
         set_error(std::string("hipDeviceSynchronize failed: ") + hipGetErrorString(err));
         index_.reset();
@@ -309,7 +384,8 @@ int ObHipvsIndex::Impl::search_gpu(const float *queries,
 {
   int ret = OB_HIPVS_OK;
   try {
-    auto query_matrix = raft::make_device_matrix<float, int64_t>(*res_, query_count, dim_);
+    detail::RaftResources &res = thread_raft_resources();
+    auto query_matrix = raft::make_device_matrix<float, int64_t>(res, query_count, dim_);
     hipError_t err = hipMemcpy(query_matrix.data_handle(),
                                queries,
                                sizeof(float) * static_cast<size_t>(query_count) * dim_,
@@ -318,13 +394,20 @@ int ObHipvsIndex::Impl::search_gpu(const float *queries,
       set_error(std::string("hipMemcpy queries failed: ") + hipGetErrorString(err));
       ret = OB_HIPVS_RUNTIME_ERROR;
     } else {
-      auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(*res_, query_count, k);
-      auto distances = raft::make_device_matrix<float, int64_t>(*res_, query_count, k);
+      auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, query_count, k);
+      auto distances = raft::make_device_matrix<float, int64_t>(res, query_count, k);
       cuvs::neighbors::cagra::search_params params;
-      // itopk_size is the main accuracy/latency knob and must be >= k.
-      params.itopk_size = static_cast<size_t>(std::max<int64_t>(k, itopk));
+      // itopk_size is the main accuracy/latency knob and must be >= k. It also
+      // cannot exceed the dataset: a per-query ef_search can be far larger than
+      // the index, which would otherwise size CAGRA's candidate buffers
+      // needlessly.
+      int64_t itopk_size = std::max<int64_t>(k, itopk);
+      if (base_count_ > 0 && itopk_size > base_count_) {
+        itopk_size = base_count_;
+      }
+      params.itopk_size = static_cast<size_t>(itopk_size);
       cuvs::neighbors::cagra::search(
-          *res_,
+          res,
           params,
           *index_,
           raft::make_device_matrix_view<const float, int64_t>(
@@ -388,6 +471,61 @@ int ObHipvsIndex::Impl::search_gpu(const float *, int64_t, int64_t, int64_t, int
 
 #endif  // OB_ENABLE_HIPVS
 
+bool ObHipvsIndex::Impl::fold_delta_and_rebuild()
+{
+  if (dim_ <= 0) {
+    set_error("hipVS fold before the index has a dimension");
+    return false;
+  }
+  const int64_t old_base = base_count_;
+  const int64_t fold_count = static_cast<int64_t>(delta_ids_.size());
+  if (fold_count == 0) {
+    // Nothing to fold. Leave a healthy graph alone; only rebuild when an
+    // earlier attempt failed and the graph is missing.
+    return base_count_ <= 0 || has_gpu_graph();
+  }
+  std::vector<int64_t> fold_ids;
+  std::vector<float> fold_vectors;
+  int64_t fold_elems = 0;
+  if (bytes_mul_overflow(fold_count, dim_, fold_elems)) {
+    set_error("delta size overflows");
+    return false;
+  }
+  // Swap the delta out before resizing. If the allocation fails the original
+  // delta is swapped back untouched, so no row is ever lost.
+  fold_ids.swap(delta_ids_);
+  fold_vectors.swap(delta_vectors_);
+  try {
+    ids_.reserve(static_cast<size_t>(old_base + fold_count));
+    vectors_.reserve(vectors_.size() + static_cast<size_t>(fold_elems));
+  } catch (const std::exception &e) {
+    set_error(std::string("failed to grow the base arrays: ") + e.what());
+    delta_ids_.swap(fold_ids);
+    delta_vectors_.swap(fold_vectors);
+    return false;
+  }
+  // Inserting trivially copyable values into a reserved buffer cannot throw.
+  ids_.insert(ids_.end(), fold_ids.begin(), fold_ids.end());
+  vectors_.insert(vectors_.end(), fold_vectors.begin(), fold_vectors.end());
+  // The position of every folded row is unchanged: a delta row i was at
+  // old_base + i and lands at old_base + i in the base array, so id_to_pos_
+  // stays valid.
+  base_count_ = old_base + fold_count;
+  if (build_gpu(-1)) {
+    return true;
+  }
+  // The rebuild failed. Put the folded rows back into the delta so queries can
+  // still merge them on the host, and restore the base arrays. build_gpu already
+  // dropped the graph, so searches of the base fall back to a host scan until a
+  // later fold rebuilds the graph.
+  delta_ids_ = std::move(fold_ids);
+  delta_vectors_ = std::move(fold_vectors);
+  ids_.resize(static_cast<size_t>(old_base));
+  vectors_.resize(static_cast<size_t>(old_base * dim_));
+  base_count_ = old_base;
+  return false;
+}
+
 ObHipvsIndex *ObHipvsIndex::build(const BuildOptions &options)
 {
 #ifdef OB_ENABLE_HIPVS
@@ -397,8 +535,10 @@ ObHipvsIndex *ObHipvsIndex::build(const BuildOptions &options)
     }
     return nullptr;
   }
-  if (options.vectors_ == nullptr || options.ids_ == nullptr || options.count_ <= 0
-      || options.dim_ <= 0) {
+  // count_ == 0 creates an empty index for the incremental DDL build path.
+  // Actual vectors then arrive through append().
+  if (options.count_ < 0 || options.dim_ <= 0
+      || (options.count_ > 0 && (options.vectors_ == nullptr || options.ids_ == nullptr))) {
     set_error("invalid vectors/ids/count/dim for hipVS build");
     return nullptr;
   }
@@ -420,8 +560,10 @@ ObHipvsIndex *ObHipvsIndex::build(const BuildOptions &options)
     return nullptr;
   }
   try {
-    impl.ids_.assign(options.ids_, options.ids_ + options.count_);
-    impl.vectors_.assign(options.vectors_, options.vectors_ + total);
+    if (options.count_ > 0) {
+      impl.ids_.assign(options.ids_, options.ids_ + options.count_);
+      impl.vectors_.assign(options.vectors_, options.vectors_ + total);
+    }
     impl.id_to_pos_.reserve(static_cast<size_t>(options.count_));
     for (int64_t i = 0; i < options.count_; ++i) {
       impl.id_to_pos_[impl.ids_[static_cast<size_t>(i)]] = i;
@@ -430,7 +572,7 @@ ObHipvsIndex *ObHipvsIndex::build(const BuildOptions &options)
     set_error(std::string("failed to copy vectors: ") + e.what());
     return nullptr;
   }
-  if (!impl.build_gpu(options.device_id_)) {
+  if (impl.base_count_ > 0 && !impl.build_gpu(options.device_id_)) {
     return nullptr;
   }
   return index.release();
@@ -559,21 +701,41 @@ ObHipvsIndex *ObHipvsIndex::deserialize(const char *data, int64_t size)
     set_error("truncated hipVS snapshot payload");
     return nullptr;
   }
-  try {
-    impl.id_to_pos_.reserve(static_cast<size_t>(base_count + delta_count));
-    for (int64_t i = 0; i < base_count; ++i) {
-      impl.id_to_pos_[impl.ids_[static_cast<size_t>(i)]] = i;
+  // The snapshot keeps the pending delta separate from the base arrays, but at
+  // load time there is nothing to gain from that split: fold everything so the
+  // graph covers the whole dataset and no query has to scan the delta.
+  if (delta_count > 0) {
+    try {
+      const int64_t offset = static_cast<int64_t>(impl.vectors_.size());
+      impl.ids_.reserve(static_cast<size_t>(base_count + delta_count));
+      impl.vectors_.reserve(static_cast<size_t>(offset + delta_elems));
+      impl.ids_.insert(impl.ids_.end(), impl.delta_ids_.begin(), impl.delta_ids_.end());
+      impl.vectors_.insert(impl.vectors_.end(), impl.delta_vectors_.begin(),
+                           impl.delta_vectors_.end());
+    } catch (const std::exception &e) {
+      set_error(std::string("failed to fold the snapshot delta: ") + e.what());
+      return nullptr;
     }
-    for (int64_t i = 0; i < delta_count; ++i) {
-      impl.id_to_pos_[impl.delta_ids_[static_cast<size_t>(i)]] = base_count + i;
+    // A delta row i sat at base_count + i and now sits at base_count + i in the
+    // base array, so the id map built below is the same either way.
+    impl.base_count_ = base_count + delta_count;
+    impl.delta_ids_.clear();
+    impl.delta_vectors_.clear();
+  }
+  try {
+    impl.id_to_pos_.reserve(static_cast<size_t>(impl.base_count_));
+    for (int64_t i = 0; i < impl.base_count_; ++i) {
+      impl.id_to_pos_[impl.ids_[static_cast<size_t>(i)]] = i;
     }
   } catch (const std::exception &e) {
     set_error(std::string("failed to rebuild id map: ") + e.what());
     return nullptr;
   }
-  if (base_count > 0 && !impl.build_gpu(-1)) {
-    set_error(std::string("failed to rebuild hipVS graph from snapshot: ") + g_last_error);
-    return nullptr;
+  if (impl.base_count_ > 0 && !impl.build_gpu(-1)) {
+    // The host copy of the snapshot is intact, so the index is still usable:
+    // searches scan the base rows on the host until a later rebuild succeeds.
+    // Failing the whole load here would take the vector index offline for a
+    // transient GPU problem. last_error() keeps the reason for the caller.
   }
   return index.release();
 }
@@ -597,8 +759,18 @@ int ObHipvsIndex::append(const float *vectors, const int64_t *ids, int64_t count
   }
   try {
     const int64_t old_delta = static_cast<int64_t>(impl_->delta_ids_.size());
-    impl_->delta_ids_.reserve(static_cast<size_t>(old_delta + count));
-    impl_->delta_vectors_.reserve(static_cast<size_t>((old_delta + count) * impl_->dim_));
+    const int64_t need_count = old_delta + count;
+    int64_t need_elems = 0;
+    if (bytes_mul_overflow(need_count, impl_->dim_, need_elems)) {
+      set_error("append size overflows");
+      return OB_HIPVS_INVALID_ARG;
+    }
+    if (static_cast<int64_t>(impl_->delta_ids_.capacity()) < need_count) {
+      impl_->delta_ids_.reserve(grown_capacity(need_count));
+    }
+    if (static_cast<int64_t>(impl_->delta_vectors_.capacity()) < need_elems) {
+      impl_->delta_vectors_.reserve(grown_capacity(need_elems));
+    }
     for (int64_t i = 0; i < count; ++i) {
       impl_->delta_ids_.push_back(ids[i]);
       impl_->delta_vectors_.insert(impl_->delta_vectors_.end(),
@@ -609,6 +781,30 @@ int ObHipvsIndex::append(const float *vectors, const int64_t *ids, int64_t count
   } catch (const std::exception &e) {
     set_error(std::string("failed to append vectors: ") + e.what());
     return OB_HIPVS_OUT_OF_MEMORY;
+  }
+  const int64_t delta_count = static_cast<int64_t>(impl_->delta_ids_.size());
+  const int64_t threshold = std::max<int64_t>(kMinFoldDelta, impl_->base_count_);
+  if (delta_count >= threshold && !impl_->fold_delta_and_rebuild()) {
+    // The rows are safely in the delta and the previous graph is still usable,
+    // so the build can continue; searches merge the delta on the host.
+    return OB_HIPVS_GRAPH_FALLBACK;
+  }
+  return OB_HIPVS_OK;
+}
+
+int ObHipvsIndex::compact()
+{
+  if (is_available() == false) {
+    return OB_HIPVS_UNAVAILABLE;
+  }
+  std::unique_lock<std::shared_mutex> lock(impl_->rw_mutex_);
+  if (impl_->dim_ <= 0) {
+    set_error("hipVS compact before build");
+    return OB_HIPVS_INVALID_ARG;
+  }
+  if (!impl_->fold_delta_and_rebuild()) {
+    set_error(std::string("failed to rebuild the hipVS graph: ") + g_last_error);
+    return OB_HIPVS_RUNTIME_ERROR;
   }
   return OB_HIPVS_OK;
 }
@@ -645,6 +841,9 @@ int ObHipvsIndex::search(const float *queries,
 #endif
   const int64_t base_count = impl_->base_count_;
   const int64_t delta_count = static_cast<int64_t>(impl_->delta_ids_.size());
+  // A failed graph rebuild leaves rows in the base array without a GPU graph.
+  // Scan them on the host instead of returning no result at all.
+  const bool scan_base_on_host = base_count > 0 && !impl_->has_gpu_graph();
   const bool use_filter = options.is_id_excluded_ != nullptr;
   const int64_t overfetch = (use_filter || delta_count > 0) ? 4 : 1;
   std::vector<int64_t> gpu_ids;
@@ -660,7 +859,7 @@ int ObHipvsIndex::search(const float *queries,
   int64_t attempt = 0;
   bool enough = true;
   do {
-    if (base_count <= 0) {
+    if (base_count <= 0 || scan_base_on_host) {
       k = 0;
     } else {
       // overfetch <= 4 and attempt < 5, so the factor itself cannot overflow.
@@ -714,6 +913,18 @@ int ObHipvsIndex::search(const float *queries,
             merged.emplace_back(row_dists[j], external);
           }
         }
+        if (scan_base_on_host) {
+          for (int64_t j = 0; j < base_count; ++j) {
+            const int64_t external = impl_->ids_[static_cast<size_t>(j)];
+            if (use_filter && options.is_id_excluded_(external, options.filter_ctx_)) {
+              continue;
+            }
+            merged.emplace_back(l2_square(query,
+                                          impl_->vectors_.data() + j * impl_->dim_,
+                                          impl_->dim_),
+                                external);
+          }
+        }
         for (int64_t j = 0; j < delta_count; ++j) {
           const int64_t external = impl_->delta_ids_[static_cast<size_t>(j)];
           if (use_filter && options.is_id_excluded_(external, options.filter_ctx_)) {
@@ -748,7 +959,7 @@ int ObHipvsIndex::search(const float *queries,
       }
     }
     ++attempt;
-  } while (!enough && k < base_count && attempt < 5);
+  } while (!enough && !scan_base_on_host && k < base_count && attempt < 5);
   return OB_HIPVS_OK;
 }
 

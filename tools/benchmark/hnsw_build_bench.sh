@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# HNSW 向量索引构建压测：vsag（CPU）对比 cuvs（AMD hipVS / GPU）
+# HNSW 向量索引构建压测：CPU（vsag）对比 GPU（AMD hipVS / CAGRA）
 #
 # 在同一张表、同一份数据上先后用 LIB=vsag 与 LIB=cuvs 构建 HNSW 索引，
 # 记录构建耗时、近似查询延迟与 recall@K，用于验证 hipVS 对索引构建链路的
 # 加速效果。
 #
+# 注意：服务端编译了 hipVS 且能看到 GPU 时，HNSW 索引默认就会走 GPU，
+# LIB=vsag 与 LIB=cuvs 都会加速。要得到 CPU 基线，请用
+# OB_HIPVS_DISABLE=1 启动 seekdb 后跑一遍本脚本，再正常启动服务端跑一遍，
+# 对比两份报告中的 build_sec（cuvs/vsag 两行应分别一致）。
+#
 # 前提：
-#   1. seekdb 以 OB_ENABLE_HIPVS=ON 编译，且运行机器可见 AMD GPU；
+#   1. seekdb 编译时探测到 hipVS（OB_ENABLE_HIPVS 默认 AUTO；也可显式
+#      指定 ON），且运行机器可见 AMD GPU；
 #   2. 服务端已启动并可连接。
 #
 # 用法:
@@ -34,6 +40,9 @@
 #   SKIP_LOAD      设为 1 跳过建表与灌数
 #   KEEP_DATA      设为 1 保留测试库（默认 0，结束时 DROP DATABASE）
 #   OUTPUT         结果追加写入的文件（可选）
+#
+# 服务端环境变量:
+#   OB_HIPVS_DISABLE=1  在 GPU 机器上强制走 vsag，用于采集 CPU 基线
 
 set -euo pipefail
 

@@ -94,6 +94,10 @@ static void adjust_create_index_max_degree(const IndexType index_type, int &max_
 // ---------------------------------------------------------------------------
 // hipVS (GPU) backend glue
 // ---------------------------------------------------------------------------
+// GPU built snapshots are framed by this header. CPU built snapshots are
+// written as a plain vsag payload so that servers without hipVS can read them;
+// the "OBSC" magic is still accepted when loading snapshots written by earlier
+// versions of this backend, which framed the vsag fallback as well.
 static constexpr uint32_t HIPVS_SNAPSHOT_MAGIC = 0x4F424856;  // "OBHV"
 static constexpr uint32_t HIPVS_CPU_SNAPSHOT_MAGIC = 0x4F425343;  // "OBSC"
 static constexpr uint32_t HIPVS_SNAPSHOT_VERSION = 1;
@@ -124,6 +128,43 @@ static bool hipvs_filter_excluded(int64_t id, void *ctx)
   return excluded;
 }
 
+// The search parameter JSON is produced by construct_vsag_search_param(), e.g.
+// {"hnsw":{"ef_search":100}}. The GPU backend honors the per-query ef_search so
+// that session-level tuning behaves like it does on the vsag path; the DDL
+// value is only the fallback.
+static bool hipvs_parse_json_int(const char *json, const char *key, int64_t &value)
+{
+  bool found = false;
+  const char *pos = json == nullptr ? nullptr : strstr(json, key);
+  if (pos != nullptr) {
+    pos = strchr(pos + strlen(key), ':');
+  }
+  if (pos != nullptr) {
+    ++pos;
+    while (*pos == ' ' || *pos == '\t') {
+      ++pos;
+    }
+    int64_t parsed = 0;
+    bool overflow = false;
+    bool any_digit = false;
+    while (*pos >= '0' && *pos <= '9') {
+      const int64_t digit = *pos - '0';
+      if (parsed > (INT64_MAX - digit) / 10) {
+        overflow = true;
+        break;
+      }
+      parsed = parsed * 10 + digit;
+      ++pos;
+      any_digit = true;
+    }
+    if (any_digit && !overflow) {
+      value = parsed;
+      found = true;
+    }
+  }
+  return found;
+}
+
 static int hipvs_status2ob(int status)
 {
   int ret = OB_ERR_VSAG_RETURN_ERROR;
@@ -139,6 +180,11 @@ static int hipvs_status2ob(int status)
       break;
     case hipvs::OB_HIPVS_UNSUPPORTED:
       ret = OB_NOT_SUPPORTED;
+      break;
+    case hipvs::OB_HIPVS_GRAPH_FALLBACK:
+      // The rows were stored; only the GPU graph rebuild failed. Queries fall
+      // back to scanning the pending rows on the host.
+      ret = OB_SUCCESS;
       break;
     case hipvs::OB_HIPVS_UNAVAILABLE:
     case hipvs::OB_HIPVS_RUNTIME_ERROR:
@@ -157,6 +203,16 @@ struct HipvsThreadResult
   std::vector<int64_t> counts_;
 };
 static thread_local HipvsThreadResult tl_hipvs_result;
+
+// Maps the HNSW M parameter to CAGRA's graph degrees. CAGRA builds a denser
+// graph than HNSW, so the degree is doubled; the upper bounds keep the values in
+// the range hipVS recommends (a degree above 128 rarely helps and makes the
+// build and the graph much more expensive).
+static void hipvs_graph_degrees(int max_degree, int &graph_degree, int &intermediate_graph_degree)
+{
+  graph_degree = std::min(128, std::max(32, max_degree * 2));
+  intermediate_graph_degree = std::min(256, std::max(64, graph_degree * 2));
+}
 
 static bool is_hipvs_capable(IndexType index_type, const char *metric,
                              uint64_t extra_info_size, int16_t refine_type)
@@ -210,9 +266,37 @@ public:
         index_type_(index_type), index_(index), allocator_(allocator),
         extra_info_size_(extra_info_size), refine_type_(refine_type),
         bq_bits_query_(bq_bits_query), bq_use_fht_(bq_use_fht),
+        // "hipvs capable" means the index will actually be served by the GPU on
+        // this host. A host without a usable GPU keeps the plain vsag snapshot
+        // format, so its data files stay byte compatible with servers that were
+        // built without hipVS.
         hipvs_capable_(use_hipvs
-                       && is_hipvs_capable(index_type, metric, extra_info_size, refine_type)),
-        use_hipvs_(hipvs_capable_ && hipvs::ObHipvsIndex::is_available()) {}
+                       && is_hipvs_capable(index_type, metric, extra_info_size, refine_type)
+                       && hipvs::ObHipvsIndex::is_available()),
+        use_hipvs_(hipvs_capable_)
+  {
+    if (use_hipvs_) {
+      // Index construction never calls build_index(): the DDL pipeline feeds
+      // rows through add_index() one at a time. Create an empty GPU index up
+      // front so those appends land on the GPU backend instead of silently
+      // falling through to the (otherwise unused) vsag index; the CAGRA graph
+      // is then built by append() once enough rows have accumulated.
+      hipvs::BuildOptions options;
+      options.dim_ = dim_;
+      options.metric_ = metric_;
+      hipvs_graph_degrees(max_degree_, options.graph_degree_,
+                          options.intermediate_graph_degree_);
+      options.ef_construction_ = ef_construction_;
+      hipvs_index_ = hipvs::ObHipvsIndex::build(options);
+      if (OB_ISNULL(hipvs_index_)) {
+        hipvs_capable_ = false;
+        use_hipvs_ = false;
+        LOG_WARN_RET(OB_ERR_VSAG_RETURN_ERROR,
+                     "[HIPVS] failed to create the gpu index, using vsag",
+                     KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      }
+    }
+  }
 
   HnswIndexHandler(bool is_create, bool is_build, bool use_static, const char *dtype, const char *metric,
       IndexType index_type, std::shared_ptr<vsag::Index> index, vsag::Allocator *allocator, uint64_t extra_info_size,
@@ -263,6 +347,7 @@ public:
                  bool need_extra_info, const char *&extra_infos,
                  void *&iter_ctx, bool is_last_search, void *allocator);
   int knn_search_hipvs(const vsag::DatasetPtr &query, int64_t topk,
+                       const std::string &parameters,
                        const float *&dist, const int64_t *&ids,
                        int64_t &result_size, FilterInterface *bitmap,
                        bool reverse_filter, bool need_extra_info,
@@ -317,9 +402,10 @@ private:
   bool use_reorder_;
   float doc_prune_ratio_;
   int window_size_;
-  // GPU backend (AMD hipVS). hipvs_capable_ records that lib=cuvs was requested
-  // and the index type/metric are supported; use_hipvs_ records that the GPU
-  // index is actually live.
+  // GPU backend (AMD hipVS). hipvs_capable_ records that the index may be
+  // served by the GPU on this host (lib=cuvs or the default vsag lib, with a
+  // supported index type/metric); use_hipvs_ records that the GPU index is
+  // actually live.
   bool hipvs_capable_ = false;
   bool use_hipvs_ = false;
   hipvs::ObHipvsIndex *hipvs_index_ = nullptr;
@@ -344,9 +430,15 @@ int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
       options.metric_ = metric_;
       // CAGRA recommends a denser graph than HNSW M; map M to a graph degree
       // the same way vsag maps M for hgraph.
-      options.graph_degree_ = std::max(32, max_degree_ * 2);
-      options.intermediate_graph_degree_ = std::max(64, options.graph_degree_ * 2);
+      hipvs_graph_degrees(max_degree_, options.graph_degree_,
+                          options.intermediate_graph_degree_);
       options.ef_construction_ = ef_construction_;
+      // A handler created for an incremental build already owns an empty GPU
+      // index; this build replaces it with the full dataset.
+      if (hipvs_index_ != nullptr) {
+        delete hipvs_index_;
+        hipvs_index_ = nullptr;
+      }
       hipvs_index_ = hipvs::ObHipvsIndex::build(options);
       if (hipvs_index_ != nullptr) {
         built_on_gpu = true;
@@ -402,7 +494,10 @@ int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
       ret = OB_INVALID_ARGUMENT;
     } else if (count > 0) {
       const int status = hipvs_index_->append(vectors, ids, count);
-      if (hipvs::OB_HIPVS_OK != status) {
+      if (hipvs::OB_HIPVS_GRAPH_FALLBACK == status) {
+        LOG_WARN("[HIPVS] gpu graph rebuild failed, appended rows stay in the host delta",
+                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else if (hipvs::OB_HIPVS_OK != status) {
         ret = hipvs_status2ob(status);
         LOG_WARN("[HIPVS] append index failed", K(ret), KCSTRING(hipvs::ObHipvsIndex::last_error()));
       }
@@ -486,7 +581,11 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
   int ret = OB_SUCCESS;
   if (use_hipvs_) {
     // extra info is not enabled for the GPU backend (see is_hipvs_capable).
-    ret = OB_NOT_SUPPORTED;
+    // An empty request is trivially satisfied and keeps callers that always
+    // issue one from failing on a supported index.
+    if (count > 0) {
+      ret = OB_NOT_SUPPORTED;
+    }
   } else {
     tl::expected<void, Error> result = index_->GetExtraInfoByIds(ids, count, extra_infos);
     if (result.has_value()) {
@@ -525,7 +624,18 @@ uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool 
 {
   
   uint64_t size = 0;
-  if (IPIVF_TYPE == index_type_) {
+  if (use_hipvs_) {
+    // CAGRA keeps the full-precision vectors plus a fixed-degree neighbor graph
+    // on the GPU. Mirror that footprint instead of asking the (empty) vsag
+    // fallback index, whose answer would understate the real allocation.
+    int hipvs_graph_degree = 0;
+    int hipvs_intermediate_degree = 0;
+    hipvs_graph_degrees(max_degree_, hipvs_graph_degree, hipvs_intermediate_degree);
+    (void)hipvs_intermediate_degree;  // only alive during the build
+    size = row_count * static_cast<uint64_t>(dim_) * sizeof(float)
+           + row_count * static_cast<uint64_t>(hipvs_graph_degree) * sizeof(uint32_t)
+           + row_count * sizeof(int64_t);
+  } else if (IPIVF_TYPE == index_type_) {
     // TODO(ningxin.ning): use vsag EstimateMemory
     size += 2 * sizeof(int64_t) * row_count;
     // nonzero dim = 100
@@ -550,8 +660,19 @@ int HnswIndexHandler::immutable_optimize()
 {
   int ret = OB_SUCCESS;
   if (use_hipvs_) {
-    // The GPU graph is immutable after build; appended vectors are served from
-    // the host delta buffer, so there is nothing to optimize.
+    // Fold whatever is left in the delta into the GPU graph, so the frozen
+    // index is served entirely by CAGRA instead of merging pending rows into
+    // every query. Failing to rebuild is not fatal: searches keep merging the
+    // delta on the host.
+    if (hipvs_index_ != nullptr) {
+      const int status = hipvs_index_->compact();
+      if (hipvs::OB_HIPVS_OK != status) {
+        LOG_WARN("[HIPVS] compact before freezing the index failed",
+                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else {
+        LOG_INFO("[HIPVS] index compacted on gpu", K(get_index_number()));
+      }
+    }
     return OB_SUCCESS;
   }
   if (index_type_ == IPIVF_TYPE) {
@@ -579,7 +700,7 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
 {
   int ret = OB_SUCCESS;
   if (use_hipvs_ && hipvs_index_ != nullptr) {
-    return knn_search_hipvs(query, topk, dist, ids, result_size, bitmap,
+    return knn_search_hipvs(query, topk, parameters, dist, ids, result_size, bitmap,
                             reverse_filter, need_extra_info, extra_infos);
   }
   std::function<bool(int64_t)> vid_filter = [bitmap, reverse_filter](int64_t id) -> bool {
@@ -637,7 +758,7 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
   if (use_hipvs_ && hipvs_index_ != nullptr) {
     // The GPU backend has no incremental iterator state; every call returns the
     // current top-k, which is a superset of the next iterator batch.
-    return knn_search_hipvs(query, topk, dist, ids, result_size, bitmap,
+    return knn_search_hipvs(query, topk, parameters, dist, ids, result_size, bitmap,
                             reverse_filter, need_extra_info, extra_infos);
   }
   std::function<bool(int64_t)> filter = [bitmap, reverse_filter](int64_t id) -> bool {
@@ -679,6 +800,7 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
 }
 
 int HnswIndexHandler::knn_search_hipvs(const vsag::DatasetPtr &query, int64_t topk,
+                                       const std::string &parameters,
                                        const float *&dist, const int64_t *&ids,
                                        int64_t &result_size, FilterInterface *bitmap,
                                        bool reverse_filter, bool need_extra_info,
@@ -701,7 +823,11 @@ int HnswIndexHandler::knn_search_hipvs(const vsag::DatasetPtr &query, int64_t to
     filter_ctx.reverse_filter_ = reverse_filter;
     hipvs::SearchOptions options;
     options.topk_ = topk;
-    options.ef_search_ = ef_search_;
+    int64_t query_ef_search = 0;
+    options.ef_search_ = hipvs_parse_json_int(parameters.c_str(), "\"ef_search\"",
+                                              query_ef_search) && query_ef_search > 0
+                             ? query_ef_search
+                             : ef_search_;
     options.is_id_excluded_ = bitmap == nullptr ? nullptr : &hipvs_filter_excluded;
     options.filter_ctx_ = bitmap == nullptr ? nullptr : &filter_ctx;
     const int64_t total = query_count * topk;
@@ -1558,10 +1684,15 @@ int knn_search(obvsag::VectorIndexPtr &index_handler, uint32_t len, uint32_t *di
 int HnswIndexHandler::serialize_index(std::ostream &out_stream)
 {
   int ret = OB_SUCCESS;
-  if (!hipvs_capable_) {
+  const bool use_gpu_payload = hipvs_capable_ && use_hipvs_ && hipvs_index_ != nullptr;
+  if (!use_gpu_payload) {
+    // Either the host has no GPU, or the GPU build failed and the vsag index is
+    // the real one. Write the plain vsag payload so that a server built without
+    // hipVS (or running on a CPU-only host) can still open the snapshot.
     tl::expected<void, Error> bs = index_->Serialize(out_stream);
     if (bs.has_value()) {
-      LOG_INFO("[OBVSAG] serialize index success");
+      LOG_INFO("[OBVSAG] serialize index success",
+               K(hipvs_capable_), K(use_hipvs_));
     } else {
       ret = vsag_errcode2ob(bs.error().type);
       LOG_WARN("[OBVSAG] fserialize error happend", K(ret), K(bs.error().type));
@@ -1570,20 +1701,15 @@ int HnswIndexHandler::serialize_index(std::ostream &out_stream)
     HipvsSnapshotHeader header;
     header.version_ = HIPVS_SNAPSHOT_VERSION;
     header.payload_size_ = 0;
-    const bool use_gpu_payload = use_hipvs_ && hipvs_index_ != nullptr;
+    header.magic_ = HIPVS_SNAPSHOT_MAGIC;
     std::vector<char> payload;
-    if (use_gpu_payload) {
-      header.magic_ = HIPVS_SNAPSHOT_MAGIC;
-      const int status = hipvs_index_->serialize(payload);
-      if (hipvs::OB_HIPVS_OK != status) {
-        ret = hipvs_status2ob(status);
-        LOG_WARN("[HIPVS] serialize gpu index failed", K(ret),
-                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
-      } else {
-        header.payload_size_ = static_cast<uint64_t>(payload.size());
-      }
+    const int status = hipvs_index_->serialize(payload);
+    if (hipvs::OB_HIPVS_OK != status) {
+      ret = hipvs_status2ob(status);
+      LOG_WARN("[HIPVS] serialize gpu index failed", K(ret),
+               KCSTRING(hipvs::ObHipvsIndex::last_error()));
     } else {
-      header.magic_ = HIPVS_CPU_SNAPSHOT_MAGIC;
+      header.payload_size_ = static_cast<uint64_t>(payload.size());
     }
     if (OB_SUCC(ret)) {
       out_stream.write(reinterpret_cast<const char *>(&header), sizeof(header));
@@ -1593,24 +1719,14 @@ int HnswIndexHandler::serialize_index(std::ostream &out_stream)
       }
     }
     if (OB_SUCC(ret)) {
-      if (use_gpu_payload) {
-        if (!payload.empty()) {
-          out_stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-        }
-        if (!out_stream.good()) {
-          ret = OB_IO_ERROR;
-          LOG_WARN("[HIPVS] write gpu snapshot payload failed", K(ret));
-        } else {
-          LOG_INFO("[HIPVS] serialize gpu index success", K(payload.size()));
-        }
+      if (!payload.empty()) {
+        out_stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+      }
+      if (!out_stream.good()) {
+        ret = OB_IO_ERROR;
+        LOG_WARN("[HIPVS] write gpu snapshot payload failed", K(ret));
       } else {
-        tl::expected<void, Error> bs = index_->Serialize(out_stream);
-        if (bs.has_value()) {
-          LOG_INFO("[OBVSAG] serialize index success with cuvs cpu fallback");
-        } else {
-          ret = vsag_errcode2ob(bs.error().type);
-          LOG_WARN("[OBVSAG] fserialize cpu fallback error", K(ret), K(bs.error().type));
-        }
+        LOG_INFO("[HIPVS] serialize gpu index success", K(payload.size()));
       }
     }
   }
@@ -1621,19 +1737,31 @@ int HnswIndexHandler::deserialize_index(std::istream &in_stream)
 {
   int ret = OB_SUCCESS;
   bool use_vsag_payload = true;
-  if (hipvs_capable_) {
+  // A snapshot written by a GPU build is framed by a small header. Snapshots
+  // written by the vsag backend - including every snapshot produced before the
+  // hipVS backend existed and every snapshot from a host without a GPU - start
+  // directly with the vsag payload. Peek at the candidate header and rewind
+  // when it does not match, so both layouts load on every host.
+  if (in_stream.good()) {
+    const std::streampos snapshot_pos = in_stream.tellg();
     HipvsSnapshotHeader header;
     MEMSET(&header, 0, sizeof(header));
     in_stream.read(reinterpret_cast<char *>(&header), sizeof(header));
-    if (in_stream.gcount() != static_cast<std::streamsize>(sizeof(header))) {
-      ret = OB_IO_ERROR;
-      LOG_WARN("[HIPVS] read snapshot header failed", K(ret), K(in_stream.gcount()));
-    } else if (header.version_ != HIPVS_SNAPSHOT_VERSION) {
+    const bool hipvs_magic = HIPVS_SNAPSHOT_MAGIC == header.magic_
+                             || HIPVS_CPU_SNAPSHOT_MAGIC == header.magic_;
+    if (in_stream.gcount() != static_cast<std::streamsize>(sizeof(header))
+        || !hipvs_magic) {
+      in_stream.clear();
+      if (snapshot_pos < 0 || !in_stream.seekg(snapshot_pos).good()) {
+        ret = OB_IO_ERROR;
+        LOG_WARN("[HIPVS] rewind snapshot stream failed", K(ret));
+      }
+    } else if (HIPVS_SNAPSHOT_VERSION != header.version_) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("[HIPVS] unsupported snapshot version", K(header.version_));
     } else if (HIPVS_SNAPSHOT_MAGIC == header.magic_) {
       use_vsag_payload = false;
-      if (!hipvs::ObHipvsIndex::is_available()) {
+      if (!hipvs_capable_ || !hipvs::ObHipvsIndex::is_available()) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("[HIPVS] gpu snapshot requires hipVS, which is unavailable",
                  KCSTRING(hipvs::ObHipvsIndex::last_error()));
@@ -1656,24 +1784,25 @@ int HnswIndexHandler::deserialize_index(std::istream &in_stream)
             ret = OB_IO_ERROR;
             LOG_WARN("[HIPVS] read snapshot payload failed", K(ret), K(in_stream.gcount()));
           } else {
-            hipvs_index_ = hipvs::ObHipvsIndex::deserialize(
+            // The handler constructor may already own an empty GPU index.
+            // Replace it instead of leaking it; the snapshot carries the data.
+            hipvs::ObHipvsIndex *loaded = hipvs::ObHipvsIndex::deserialize(
                 payload.data(), static_cast<int64_t>(payload.size()));
-            if (hipvs_index_ == nullptr) {
+            if (loaded == nullptr) {
               ret = OB_ERR_VSAG_RETURN_ERROR;
               LOG_WARN("[HIPVS] deserialize gpu snapshot failed",
                        KCSTRING(hipvs::ObHipvsIndex::last_error()));
             } else {
+              if (hipvs_index_ != nullptr) {
+                delete hipvs_index_;
+              }
+              hipvs_index_ = loaded;
               use_hipvs_ = true;
               LOG_INFO("[HIPVS] deserialize gpu snapshot success", K(header.payload_size_));
             }
           }
         }
       }
-    } else if (HIPVS_CPU_SNAPSHOT_MAGIC == header.magic_) {
-      use_vsag_payload = true;
-    } else {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("[HIPVS] unknown snapshot magic", K(header.magic_));
     }
   }
   if (OB_SUCC(ret) && use_vsag_payload) {

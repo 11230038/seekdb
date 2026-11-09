@@ -15,16 +15,47 @@ set_source_files_properties(
   PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 ob_lib_add_target(oblib_lib)
 
-if(OB_ENABLE_HIPVS)
+if(OB_HIPVS_ENABLED)
   find_package(cuvs CONFIG REQUIRED)
   if(EXISTS "${HIPVS_ROOT}/include")
     target_include_directories(oblib_lib PRIVATE "${HIPVS_ROOT}/include")
   endif()
-  # hipVS headers are normally consumed through hipcc, which predefines the
-  # platform macro. The bridge is compiled by the project's clang++ so define it
-  # explicitly; without it <hip/hip_runtime.h> rejects the translation unit.
+  # Define the platform macro explicitly so the bridge does not depend on how the
+  # HIP headers detect the platform; without it <hip/hip_runtime.h> rejects the
+  # translation unit.
   target_compile_definitions(oblib_lib PRIVATE OB_ENABLE_HIPVS=1 __HIP_PLATFORM_AMD__=1)
-  target_link_libraries(oblib_lib PUBLIC cuvs::cuvs)
+  # Keep the GPU dependency private to OBLib: the bridge is only referenced by
+  # ob_vsag_adaptor.cpp in this same static library. PRIVATE still propagates the
+  # link dependency to the final executable, but without leaking HIP compile
+  # options or include paths into every other target in the tree.
+  target_link_libraries(oblib_lib PRIVATE cuvs::cuvs)
+  if(OB_HIPVS_HIP_TOOLCHAIN)
+    # cuVS/hipVS instantiate device code from their headers, so the bridge must be
+    # compiled by the HIP toolchain. Only this one source switches languages;
+    # the rest of the target keeps using the host C++ compiler.
+    set_source_files_properties(
+      ${CMAKE_SOURCE_DIR}/src/oblib/lib/vector/ob_hipvs_bridge.cpp
+      PROPERTIES LANGUAGE HIP)
+    find_package(hip CONFIG QUIET)
+    if(TARGET hip::host)
+      target_link_libraries(oblib_lib PRIVATE hip::host)
+    endif()
+    if(TARGET hip::device)
+      target_link_libraries(oblib_lib PRIVATE hip::device)
+    endif()
+    if(NOT TARGET hip::host AND CMAKE_HIP_COMPILER)
+      # The hip package config was not found; derive the ROCm root from the
+      # compiler location (ROCM/bin/amdclang++) so <hip/hip_runtime.h> and
+      # libamdhip64 are still reachable.
+      get_filename_component(hipvs_compiler_bin "${CMAKE_HIP_COMPILER}" DIRECTORY)
+      get_filename_component(hipvs_rocm_root "${hipvs_compiler_bin}" DIRECTORY)
+      if(EXISTS "${hipvs_rocm_root}/include/hip/hip_runtime.h")
+        target_include_directories(oblib_lib PRIVATE "${hipvs_rocm_root}/include")
+        target_link_directories(oblib_lib PRIVATE "${hipvs_rocm_root}/lib")
+        target_link_libraries(oblib_lib PRIVATE amdhip64)
+      endif()
+    endif()
+  endif()
 endif()
 
 seekdb_apply_unity_inventory(oblib_lib_simd SEEKDB_OBLIB_SIMD_UNITY)

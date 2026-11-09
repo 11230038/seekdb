@@ -31,15 +31,104 @@ endif()
 
 option(OB_ENABLE_STANDBY "Build physical standby support" ON)
 option(ENABLE_SANITY "Build with seekdb memory Sanity instrumentation" OFF)
-option(OB_ENABLE_HIPVS "Build the AMD hipVS (GPU) vector index backend" OFF)
+# AUTO compiles the GPU backend whenever a hipVS/cuVS package is discoverable,
+# so a machine with an AMD Radeon GPU needs no extra build flag. A missing
+# hipVS install leaves the build identical to the CPU-only configuration.
+set(OB_ENABLE_HIPVS "AUTO" CACHE STRING
+  "Build the AMD hipVS (GPU) vector index backend: AUTO, ON, or OFF")
+set_property(CACHE OB_ENABLE_HIPVS PROPERTY STRINGS AUTO ON OFF)
 set(HIPVS_ROOT "/opt/hipvs" CACHE PATH "hipVS installation prefix")
-if(OB_ENABLE_HIPVS)
-  # hipVS installs a cuvs package config; make sure a non-system prefix is
-  # searched even when the caller only passes -DHIPVS_ROOT=...
-  if(HIPVS_ROOT)
-    list(APPEND CMAKE_PREFIX_PATH "${HIPVS_ROOT}")
-  endif()
+# hipVS installs a cuvs package config; make sure a non-system prefix is
+# searched even when the caller only passes -DHIPVS_ROOT=...
+if(HIPVS_ROOT)
+  list(APPEND CMAKE_PREFIX_PATH "${HIPVS_ROOT}")
 endif()
+# hipVS is commonly installed next to ROCm or under /usr/local. Probe those
+# prefixes as well so AUTO does not silently miss an existing installation.
+foreach(hipvs_hint IN ITEMS "$ENV{HIPVS_ROOT}" "$ENV{ROCM_PATH}" "/opt/rocm" "/usr/local")
+  if(hipvs_hint AND EXISTS "${hipvs_hint}")
+    list(APPEND CMAKE_PREFIX_PATH "${hipvs_hint}")
+  endif()
+endforeach()
+string(TOUPPER "${OB_ENABLE_HIPVS}" OB_HIPVS_MODE)
+if(OB_HIPVS_MODE STREQUAL "AUTO")
+  find_package(cuvs CONFIG QUIET)
+  if(cuvs_FOUND)
+    set(OB_HIPVS_ENABLED ON)
+  else()
+    set(OB_HIPVS_ENABLED OFF)
+  endif()
+elseif(OB_ENABLE_HIPVS)
+  set(OB_HIPVS_ENABLED ON)
+else()
+  set(OB_HIPVS_ENABLED OFF)
+endif()
+if(OB_HIPVS_ENABLED AND CMAKE_VERSION VERSION_LESS 3.21)
+  # The HIP language was added in CMake 3.21. The project still accepts 3.20 for
+  # CPU-only builds, so probe for the GPU backend only when the toolchain is new
+  # enough to drive hipcc instead of failing the configuration.
+  message(WARNING "CMake ${CMAKE_VERSION} cannot build the hipVS bridge "
+    "(HIP language requires CMake 3.21+); building without the GPU vector index backend")
+  set(OB_HIPVS_ENABLED OFF)
+endif()
+if(OB_HIPVS_ENABLED)
+  # The bridge instantiates cuVS/hipVS templates that emit device code, so the
+  # translation unit has to be compiled by the HIP toolchain (hipcc). Without a
+  # usable HIP compiler the headers cannot be built by the host C++ compiler, so
+  # disable the backend instead of producing a broken build.
+  # Point HIP discovery at a common ROCm install when ROCm is not in PATH.
+  if(NOT CMAKE_HIP_COMPILER)
+    foreach(hip_compiler_hint IN ITEMS
+        "$ENV{ROCM_PATH}/bin/amdclang++" "/opt/rocm/bin/amdclang++")
+      if(hip_compiler_hint AND EXISTS "${hip_compiler_hint}")
+        set(CMAKE_HIP_COMPILER "${hip_compiler_hint}" CACHE FILEPATH
+          "HIP compiler used to build the hipVS bridge")
+        break()
+      endif()
+    endforeach()
+  endif()
+  # HIP code must target the GPUs of the machine that will run it; a compiler
+  # default easily produces a binary that cannot launch on the installed card.
+  # Ask ROCm's own enumerator, which also works when /opt/rocm/bin is not on
+  # PATH. A cross build can always pre-set CMAKE_HIP_ARCHITECTURES explicitly.
+  if(NOT CMAKE_HIP_ARCHITECTURES)
+    find_program(ROCM_AGENT_ENUMERATOR rocm_agent_enumerator
+      HINTS "${HIPVS_ROOT}/bin" "$ENV{ROCM_PATH}/bin" "/opt/rocm/bin")
+    if(ROCM_AGENT_ENUMERATOR)
+      execute_process(COMMAND "${ROCM_AGENT_ENUMERATOR}"
+        OUTPUT_VARIABLE hipvs_agents OUTPUT_STRIP_TRAILING_WHITESPACE)
+      string(REPLACE "\n" ";" hipvs_agents "${hipvs_agents}")
+      set(hipvs_archs "")
+      foreach(hipvs_agent IN LISTS hipvs_agents)
+        string(STRIP "${hipvs_agent}" hipvs_agent)
+        if(hipvs_agent MATCHES "^gfx[0-9a-z]+$")
+          list(APPEND hipvs_archs "${hipvs_agent}")
+        endif()
+      endforeach()
+      if(hipvs_archs)
+        list(REMOVE_DUPLICATES hipvs_archs)
+        string(REPLACE ";" " " hipvs_archs "${hipvs_archs}")
+        set(CMAKE_HIP_ARCHITECTURES "${hipvs_archs}" CACHE STRING
+          "GPU architectures the hipVS bridge is built for")
+        message(STATUS "hipVS GPU architectures: ${CMAKE_HIP_ARCHITECTURES}")
+      endif()
+    endif()
+  endif()
+  include(CheckLanguage)
+  check_language(HIP)
+  if(CMAKE_HIP_COMPILER)
+    enable_language(HIP)
+    set(OB_HIPVS_HIP_TOOLCHAIN ON)
+  else()
+    message(WARNING "hipVS was found but no HIP compiler is available; "
+      "building without the GPU vector index backend")
+    set(OB_HIPVS_ENABLED OFF)
+    set(OB_HIPVS_HIP_TOOLCHAIN OFF)
+  endif()
+else()
+  set(OB_HIPVS_HIP_TOOLCHAIN OFF)
+endif()
+message(STATUS "hipVS GPU vector index backend: ${OB_HIPVS_ENABLED}")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(SEEKDB_GENERATED_ROOT "${CMAKE_BINARY_DIR}/generated")

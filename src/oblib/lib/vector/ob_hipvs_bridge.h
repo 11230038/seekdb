@@ -35,8 +35,9 @@ namespace hipvs
  * unchanged when hipVS is not available: every entry point then reports
  * "unavailable" and the caller falls back to the vsag CPU backend.
  *
- * Build with -DOB_ENABLE_HIPVS=ON and point HIPVS_ROOT at the hipVS
- * installation (default /opt/hipvs) to enable the GPU implementation.
+ * The GPU implementation is compiled when the hipVS cmake package is found
+ * (OB_ENABLE_HIPVS=AUTO by default); HIPVS_ROOT may point at a non-system
+ * installation (default /opt/hipvs).
  */
 
 enum ObHipvsStatus
@@ -47,6 +48,10 @@ enum ObHipvsStatus
   OB_HIPVS_OUT_OF_MEMORY = 3,
   OB_HIPVS_UNSUPPORTED = 4,
   OB_HIPVS_RUNTIME_ERROR = 5,
+  // The vectors of append() were accepted but the CAGRA graph could not be
+  // rebuilt. The index stays usable: pending vectors are scanned on the host
+  // and merged into every search result until a later rebuild succeeds.
+  OB_HIPVS_GRAPH_FALLBACK = 6,
   OB_HIPVS_MAX
 };
 
@@ -83,7 +88,9 @@ public:
   // Human readable reason of the last failure on the calling thread.
   static const char *last_error();
 
-  // Builds a GPU graph index (CAGRA) from host vectors and ids.
+  // Builds a GPU graph index (CAGRA) from host vectors and ids. count_ may be
+  // zero, which creates an empty index that is filled through append(); the
+  // graph is then built on the GPU as soon as enough rows have accumulated.
   // Returns nullptr on failure; use last_error() for details.
   static ObHipvsIndex *build(const BuildOptions &options);
 
@@ -94,9 +101,18 @@ public:
   ObHipvsIndex(const ObHipvsIndex &) = delete;
   ObHipvsIndex &operator=(const ObHipvsIndex &) = delete;
 
-  // Appends vectors to the host side delta buffer. GPU graph construction is
-  // not touched, which keeps the fast path immutable for concurrent readers.
+  // Appends vectors to the host side delta buffer. Because the seekdb DDL
+  // build path feeds rows through one add at a time, the delta is folded into
+  // the base and the CAGRA graph is rebuilt on the GPU whenever the delta has
+  // grown past a threshold, so construction really happens on the GPU instead
+  // of waiting for a one shot build() that the DDL path never issues.
+  // Returns OB_HIPVS_GRAPH_FALLBACK when the rows were accepted but the graph
+  // rebuild failed; queries then merge the delta on the host.
   int append(const float *vectors, const int64_t *ids, int64_t count);
+
+  // Folds the pending delta into the base and rebuilds the GPU graph. Called
+  // when the index is made immutable and after a snapshot is loaded.
+  int compact();
 
   // Searches the GPU graph and the host delta buffer, merging both result
   // sets. ids/distances are caller owned arrays of capacity topk * query_count.

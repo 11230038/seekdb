@@ -39,6 +39,19 @@ namespace oceanbase
 namespace share
 {
 
+// LIB=CUVS asks for the hipVS backend explicitly. HNSW indexes that keep the
+// default vsag lib are eligible as well: the vsag adaptor builds them on the
+// GPU whenever the server was compiled with hipVS and a GPU is visible, and
+// transparently falls back to vsag otherwise. This accelerates the existing
+// HNSW build path without requiring a DDL change. LIB=OB (IVF, sparse) keeps
+// using its native implementation.
+static bool hipvs_allowed_for(const ObVectorIndexParam *param)
+{
+  return nullptr != param
+         && (ObVectorIndexAlgorithmLib::VIAL_CUVS == param->lib_
+             || ObVectorIndexAlgorithmLib::VIAL_VSAG == param->lib_);
+}
+
 ObVectorIndexInfo::ObVectorIndexInfo()
   : rowkey_vid_table_id_(common::OB_INVALID_ID),
     vid_rowkey_table_id_(common::OB_INVALID_ID),
@@ -880,7 +893,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                param->refine_type_,
                                                param->bq_bits_query_,
                                                param->bq_use_fht_,
-                                               param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS))) {
+                                               hipvs_allowed_for(param)))) {
         }
       }
 
@@ -938,7 +951,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
                                              param->refine_type_,
                                              param->bq_bits_query_,
                                              param->bq_use_fht_,
-                                             param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS))) {
+                                             hipvs_allowed_for(param)))) {
       }
     }
 

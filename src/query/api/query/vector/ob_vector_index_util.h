@@ -99,11 +99,15 @@ enum ObVectorIndexDistAlgorithm
 enum ObVectorIndexAlgorithmLib
 {
   VIAL_VSAG = 0,
-  VIAL_OB,
-  // GPU accelerated graph construction through AMD hipVS (CAGRA). Falls back
-  // to VIAL_VSAG at runtime when hipVS or a supported GPU is unavailable.
-  VIAL_CUVS,
-  VIAL_MAX
+  VIAL_OB = 1,
+  // Historical "lib not specified" sentinel. Its numeric value is persisted in
+  // index metadata and must not be reused: sparse indexes keep this value.
+  VIAL_MAX = 2,
+  // GPU accelerated graph construction through AMD hipVS (CAGRA). Appended
+  // after the persisted sentinel so rows written by older servers are never
+  // reinterpreted as this lib. Falls back to VIAL_VSAG at runtime when hipVS or
+  // a supported GPU is unavailable.
+  VIAL_CUVS = 3,
 };
 
 enum ObVectorIndexType

@@ -83,11 +83,11 @@ int create_index(obvsag::VectorIndexPtr& index_handler, int index_type,
                  int max_degree, int ef_construction, int ef_search,
                  void* allocator, int extra_info_size /*= 0*/,
                  int16_t refine_type /*= 0*/, int16_t bq_bits_query /*= 32*/,
-                 bool bq_use_fht /*= false*/)
+                 bool bq_use_fht /*= false*/, bool use_hipvs /*= false*/)
 {
   obvsag::set_block_size_limit(2*1024*1024);
   LOG_INFO("vector index create params: ", K(index_type), K(dim), KCSTRING(dtype), KCSTRING(metric), K(max_degree), K(ef_construction), K(ef_search),
-      KP(allocator), K(extra_info_size), K(refine_type), K(bq_bits_query), K(bq_use_fht));
+      KP(allocator), K(extra_info_size), K(refine_type), K(bq_bits_query), K(bq_use_fht), K(use_hipvs));
   return obvsag::create_index(index_handler,
                                    static_cast<obvsag::IndexType>(index_type),
                                    dtype, metric,
@@ -99,7 +99,8 @@ int create_index(obvsag::VectorIndexPtr& index_handler, int index_type,
                                    extra_info_size,
                                    refine_type,
                                    bq_bits_query,
-                                   bq_use_fht);
+                                   bq_use_fht,
+                                   use_hipvs);
 }
 
 int validate_create_index(const CreateIndexParam &param, std::string &err_msg)

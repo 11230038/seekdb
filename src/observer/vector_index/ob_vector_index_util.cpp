@@ -257,6 +257,8 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_VSAG;
           } else if (new_param_value == "OB") {
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_OB;
+          } else if (new_param_value == "CUVS") {
+            param.lib_ = ObVectorIndexAlgorithmLib::VIAL_CUVS;
           } else {
             ret = OB_NOT_SUPPORTED;
           }
@@ -1030,6 +1032,8 @@ int ObVectorIndexUtil::construct_rebuild_index_param(
         tmp_lib = ObString("VSAG");
       } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_OB) {
         tmp_lib = ObString("OB");
+      } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS) {
+        tmp_lib = ObString("CUVS");
       } else {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -2991,7 +2995,8 @@ int ObVectorIndexUtil::check_index_param(
           }
         } else if (last_variable == "LIB") {
           if (new_parser_name == "VSAG" ||
-              new_parser_name == "OB") {
+              new_parser_name == "OB" ||
+              new_parser_name == "CUVS") {
             lib_is_set = true;
             lib_name = new_parser_name;
           } else {
@@ -3293,9 +3298,9 @@ int ObVectorIndexUtil::check_index_param(
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index m is");
         }
         if (OB_FAIL(ret)) {
-        } else if (lib_is_set && lib_name != "VSAG") {
+        } else if (lib_is_set && lib_name != "VSAG" && lib_name != "CUVS") {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' is");
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' or 'CUVS' is");
         }
         if (OB_FAIL(ret)) {
         } else if (ef_construction_value <= m_value) {
@@ -3422,6 +3427,11 @@ int ObVectorIndexUtil::check_index_param(
           }
         }
         if (OB_FAIL(ret)) {
+        } else if (lib_is_set && lib_name == "CUVS") {
+          // The sparse (SINDI) index is only implemented by vsag; the hipVS
+          // backend has no sparse graph construction path.
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "cuvs lib on sparse vector index is");
         } else if (OB_FAIL(validate_vector_index_vsag_create_index_param(vsag_index_type,
                                                                         distance_name,
                                                                         0,

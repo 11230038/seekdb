@@ -7,7 +7,22 @@ seekdb_apply_unity_inventory(oblib_lib SEEKDB_OBLIB_LIB_UNITY)
 set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/src/oblib/lib/oblog/ob_log_compressor.cpp
   PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+# The hipVS bridge pulls in HIP/cuVS headers that do not tolerate being mixed
+# into a unity translation unit, and it is only meaningful when the GPU backend
+# is enabled. Keep it as a standalone object.
+set_source_files_properties(
+  ${CMAKE_SOURCE_DIR}/src/oblib/lib/vector/ob_hipvs_bridge.cpp
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 ob_lib_add_target(oblib_lib)
+
+if(OB_ENABLE_HIPVS)
+  find_package(cuvs CONFIG REQUIRED)
+  if(EXISTS "${HIPVS_ROOT}/include")
+    target_include_directories(oblib_lib PRIVATE "${HIPVS_ROOT}/include")
+  endif()
+  target_compile_definitions(oblib_lib PRIVATE OB_ENABLE_HIPVS=1)
+  target_link_libraries(oblib_lib PUBLIC cuvs::cuvs)
+endif()
 
 seekdb_apply_unity_inventory(oblib_lib_simd SEEKDB_OBLIB_SIMD_UNITY)
 ob_lib_add_target(oblib_lib_simd)

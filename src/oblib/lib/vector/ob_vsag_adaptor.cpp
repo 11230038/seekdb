@@ -17,7 +17,14 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <istream>
 #include <map>
+#include <ostream>
+#include <vector>
+#include "lib/vector/ob_hipvs_bridge.h"
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -84,6 +91,86 @@ static void adjust_create_index_max_degree(const IndexType index_type, int &max_
   }
 }
 
+// ---------------------------------------------------------------------------
+// hipVS (GPU) backend glue
+// ---------------------------------------------------------------------------
+static constexpr uint32_t HIPVS_SNAPSHOT_MAGIC = 0x4F424856;  // "OBHV"
+static constexpr uint32_t HIPVS_CPU_SNAPSHOT_MAGIC = 0x4F425343;  // "OBSC"
+static constexpr uint32_t HIPVS_SNAPSHOT_VERSION = 1;
+
+struct HipvsSnapshotHeader
+{
+  uint32_t magic_;
+  uint32_t version_;
+  uint64_t payload_size_;
+};
+
+struct HipvsFilterCtx
+{
+  FilterInterface *bitmap_;
+  bool reverse_filter_;
+};
+
+static bool hipvs_filter_excluded(int64_t id, void *ctx)
+{
+  bool excluded = false;
+  if (ctx != nullptr) {
+    HipvsFilterCtx *filter = static_cast<HipvsFilterCtx *>(ctx);
+    if (filter->bitmap_ != nullptr) {
+      const bool matched = filter->bitmap_->test(id);
+      excluded = filter->reverse_filter_ ? !matched : matched;
+    }
+  }
+  return excluded;
+}
+
+static int hipvs_status2ob(int status)
+{
+  int ret = OB_ERR_VSAG_RETURN_ERROR;
+  switch (status) {
+    case hipvs::OB_HIPVS_OK:
+      ret = OB_SUCCESS;
+      break;
+    case hipvs::OB_HIPVS_INVALID_ARG:
+      ret = OB_INVALID_ARGUMENT;
+      break;
+    case hipvs::OB_HIPVS_OUT_OF_MEMORY:
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      break;
+    case hipvs::OB_HIPVS_UNSUPPORTED:
+      ret = OB_NOT_SUPPORTED;
+      break;
+    case hipvs::OB_HIPVS_UNAVAILABLE:
+    case hipvs::OB_HIPVS_RUNTIME_ERROR:
+    default:
+      ret = OB_ERR_VSAG_RETURN_ERROR;
+      break;
+  }
+  return ret;
+}
+
+struct HipvsThreadResult
+{
+  std::vector<int64_t> ids_;
+  std::vector<float> distances_;
+  std::vector<float> distances_by_id_;
+  std::vector<int64_t> counts_;
+};
+static thread_local HipvsThreadResult tl_hipvs_result;
+
+static bool is_hipvs_capable(IndexType index_type, const char *metric,
+                             uint64_t extra_info_size, int16_t refine_type)
+{
+  bool capable = HNSW_TYPE == index_type && 0 == extra_info_size
+                 && QuantizationType::FP32 == refine_type && metric != nullptr;
+  // The GPU backend implements the l2 metric only; ip/cosine keep using vsag.
+  if (capable) {
+    capable = (metric[0] == 'l' || metric[0] == 'L') && metric[1] == '2'
+              && metric[2] == '\0';
+  }
+  return capable;
+}
+
 class ObVasgFilter final : public vsag::Filter {
 public:
   ObVasgFilter(float valid_ratio,
@@ -115,13 +202,17 @@ public:
                    int ef_construction, int ef_search, int dim,
                    IndexType index_type, std::shared_ptr<vsag::Index> index,
                    vsag::Allocator *allocator, uint64_t extra_info_size,
-                   int16_t refine_type, int16_t bq_bits_query, bool bq_use_fht)
+                   int16_t refine_type, int16_t bq_bits_query, bool bq_use_fht,
+                   bool use_hipvs = false)
       : is_created_(is_create), is_build_(is_build), use_static_(use_static),
         dtype_(dtype), metric_(metric), max_degree_(max_degree),
         ef_construction_(ef_construction), ef_search_(ef_search), dim_(dim),
         index_type_(index_type), index_(index), allocator_(allocator),
         extra_info_size_(extra_info_size), refine_type_(refine_type),
-        bq_bits_query_(bq_bits_query), bq_use_fht_(bq_use_fht) {}
+        bq_bits_query_(bq_bits_query), bq_use_fht_(bq_use_fht),
+        hipvs_capable_(use_hipvs
+                       && is_hipvs_capable(index_type, metric, extra_info_size, refine_type)),
+        use_hipvs_(hipvs_capable_ && hipvs::ObHipvsIndex::is_available()) {}
 
   HnswIndexHandler(bool is_create, bool is_build, bool use_static, const char *dtype, const char *metric,
       IndexType index_type, std::shared_ptr<vsag::Index> index, vsag::Allocator *allocator, uint64_t extra_info_size,
@@ -141,6 +232,10 @@ public:
   {}
 
   ~HnswIndexHandler() {
+    if (hipvs_index_ != nullptr) {
+      delete hipvs_index_;
+      hipvs_index_ = nullptr;
+    }
     index_ = nullptr;
     LOG_INFO("[OBVSAG] after deconstruction, hnsw index", KP(allocator_), K(index_.use_count()), K(lbt()));
   }
@@ -167,9 +262,18 @@ public:
                  int index_type, FilterInterface *bitmap, bool reverse_filter,
                  bool need_extra_info, const char *&extra_infos,
                  void *&iter_ctx, bool is_last_search, void *allocator);
+  int knn_search_hipvs(const vsag::DatasetPtr &query, int64_t topk,
+                       const float *&dist, const int64_t *&ids,
+                       int64_t &result_size, FilterInterface *bitmap,
+                       bool reverse_filter, bool need_extra_info,
+                       const char *&extra_infos);
   int immutable_optimize();
+  int serialize_index(std::ostream &out_stream);
+  int deserialize_index(std::istream &in_stream);
 
   std::shared_ptr<vsag::Index> &get_index() { return index_; }
+  inline bool use_hipvs() const { return use_hipvs_; }
+  inline bool hipvs_capable() const { return hipvs_capable_; }
   void set_index(std::shared_ptr<vsag::Index> hnsw) { index_ = hnsw; }
   vsag::Allocator *get_allocator() const { return allocator_; }
   inline bool get_use_static() const { return use_static_; }
@@ -213,11 +317,53 @@ private:
   bool use_reorder_;
   float doc_prune_ratio_;
   int window_size_;
+  // GPU backend (AMD hipVS). hipvs_capable_ records that lib=cuvs was requested
+  // and the index type/metric are supported; use_hipvs_ records that the GPU
+  // index is actually live.
+  bool hipvs_capable_ = false;
+  bool use_hipvs_ = false;
+  hipvs::ObHipvsIndex *hipvs_index_ = nullptr;
 };
 
 int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 {
   int ret = OB_SUCCESS;
+  bool built_on_gpu = false;
+  if (use_hipvs_) {
+    const bool can_build_on_gpu = base != nullptr && base->GetFloat32Vectors() != nullptr
+                                  && base->GetIds() != nullptr && base->GetNumElements() > 0;
+    if (!can_build_on_gpu) {
+      use_hipvs_ = false;
+      LOG_WARN("[HIPVS] dataset is not usable for gpu build, fallback to vsag");
+    } else {
+      hipvs::BuildOptions options;
+      options.vectors_ = base->GetFloat32Vectors();
+      options.ids_ = base->GetIds();
+      options.count_ = base->GetNumElements();
+      options.dim_ = base->GetDim() > 0 ? base->GetDim() : dim_;
+      options.metric_ = metric_;
+      // CAGRA recommends a denser graph than HNSW M; map M to a graph degree
+      // the same way vsag maps M for hgraph.
+      options.graph_degree_ = std::max(32, max_degree_ * 2);
+      options.intermediate_graph_degree_ = std::max(64, options.graph_degree_ * 2);
+      options.ef_construction_ = ef_construction_;
+      hipvs_index_ = hipvs::ObHipvsIndex::build(options);
+      if (hipvs_index_ != nullptr) {
+        built_on_gpu = true;
+        LOG_INFO("[HIPVS] build index on gpu success", K(options.count_), K(options.dim_),
+                 K(options.graph_degree_), KCSTRING(metric_), K(lbt()));
+      } else {
+        // Degrade to the CPU backend; the vsag index created in create_index is
+        // still empty and can be built normally.
+        use_hipvs_ = false;
+        LOG_WARN("[HIPVS] gpu build failed, fallback to vsag",
+                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      }
+    }
+  }
+  if (built_on_gpu) {
+    return OB_SUCCESS;
+  }
   try {
     tl::expected<std::vector<int64_t>, Error> result = index_->Build(base);
     if (result.has_value()) {
@@ -236,12 +382,33 @@ int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 
 int HnswIndexHandler::get_index_number()
 {
-  return index_->GetNumElements();
+  int64_t size = 0;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    size = hipvs_index_->size();
+  } else {
+    size = index_->GetNumElements();
+  }
+  return static_cast<int>(size);
 }
 
 int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    const float *vectors = incremental == nullptr ? nullptr : incremental->GetFloat32Vectors();
+    const int64_t *ids = incremental == nullptr ? nullptr : incremental->GetIds();
+    const int64_t count = incremental == nullptr ? 0 : incremental->GetNumElements();
+    if (vectors == nullptr || ids == nullptr || count < 0) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (count > 0) {
+      const int status = hipvs_index_->append(vectors, ids, count);
+      if (hipvs::OB_HIPVS_OK != status) {
+        ret = hipvs_status2ob(status);
+        LOG_WARN("[HIPVS] append index failed", K(ret), KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      }
+    }
+    return ret;
+  }
   tl::expected<std::vector<int64_t>, Error> result = index_->Add(incremental);
   if (result.has_value()) {
     LOG_DEBUG("add index success", K(get_index_number()));
@@ -285,6 +452,24 @@ int HnswIndexHandler::cal_distance_by_id(const float *vector,
                                          const float *&dist)
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    try {
+      tl_hipvs_result.distances_by_id_.resize(static_cast<size_t>(count));
+    } catch (const std::exception &e) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[HIPVS] allocate distance buffer failed", K(ret), "what", e.what());
+    }
+    if (OB_SUCC(ret)) {
+      const int status = hipvs_index_->calc_distance_by_id(
+          vector, ids, count, tl_hipvs_result.distances_by_id_.data());
+      if (hipvs::OB_HIPVS_OK != status) {
+        ret = hipvs_status2ob(status);
+      } else {
+        dist = tl_hipvs_result.distances_by_id_.data();
+      }
+    }
+    return ret;
+  }
   tl::expected<DatasetPtr, Error> result = index_->CalDistanceById(vector, ids, count);
   if (result.has_value()) {
     result.value()->Owner(false);
@@ -299,10 +484,15 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
                                             char *extra_infos)
 {
   int ret = OB_SUCCESS;
-  tl::expected<void, Error> result = index_->GetExtraInfoByIds(ids, count, extra_infos);
-  if (result.has_value()) {
+  if (use_hipvs_) {
+    // extra info is not enabled for the GPU backend (see is_hipvs_capable).
+    ret = OB_NOT_SUPPORTED;
   } else {
-    ret = vsag_errcode2ob(result.error().type);
+    tl::expected<void, Error> result = index_->GetExtraInfoByIds(ids, count, extra_infos);
+    if (result.has_value()) {
+    } else {
+      ret = vsag_errcode2ob(result.error().type);
+    }
   }
   return ret;
 }
@@ -310,6 +500,13 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
 int HnswIndexHandler::get_vid_bound(int64_t &min_vid, int64_t &max_vid)
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    const int status = hipvs_index_->get_vid_bound(min_vid, max_vid);
+    if (hipvs::OB_HIPVS_OK != status) {
+      ret = hipvs_status2ob(status);
+    }
+    return ret;
+  }
   int64_t element_cnt = index_->GetNumElements();
   if (element_cnt == 0) {
   } else {
@@ -352,6 +549,11 @@ uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool 
 int HnswIndexHandler::immutable_optimize()
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_) {
+    // The GPU graph is immutable after build; appended vectors are served from
+    // the host delta buffer, so there is nothing to optimize.
+    return OB_SUCCESS;
+  }
   if (index_type_ == IPIVF_TYPE) {
     // TODO(ningxin.ning): support SetImmutable for sparse vector index
   } else {
@@ -376,6 +578,10 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  float distance_threshold)
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    return knn_search_hipvs(query, topk, dist, ids, result_size, bitmap,
+                            reverse_filter, need_extra_info, extra_infos);
+  }
   std::function<bool(int64_t)> vid_filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
       return bitmap->test(id);
@@ -428,6 +634,12 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  bool is_last_search, void *allocator)
 {
   int ret = OB_SUCCESS;
+  if (use_hipvs_ && hipvs_index_ != nullptr) {
+    // The GPU backend has no incremental iterator state; every call returns the
+    // current top-k, which is a superset of the next iterator batch.
+    return knn_search_hipvs(query, topk, dist, ids, result_size, bitmap,
+                            reverse_filter, need_extra_info, extra_infos);
+  }
   std::function<bool(int64_t)> filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
       return bitmap->test(id);
@@ -462,6 +674,82 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
     }
   } else {
     ret = vsag_errcode2ob(result.error().type);
+  }
+  return ret;
+}
+
+int HnswIndexHandler::knn_search_hipvs(const vsag::DatasetPtr &query, int64_t topk,
+                                       const float *&dist, const int64_t *&ids,
+                                       int64_t &result_size, FilterInterface *bitmap,
+                                       bool reverse_filter, bool need_extra_info,
+                                       const char *&extra_infos)
+{
+  int ret = OB_SUCCESS;
+  const float *query_vector = query == nullptr ? nullptr : query->GetFloat32Vectors();
+  const int64_t query_count = query == nullptr ? 0 : query->GetNumElements();
+  const int64_t query_dim = query == nullptr ? 0 : query->GetDim();
+  if (OB_ISNULL(query_vector) || query_count <= 0 || topk <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (query_dim != static_cast<int64_t>(dim_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[HIPVS] query dim mismatch", K(query_dim), K(dim_));
+  } else if (query_count > INT64_MAX / topk) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    HipvsFilterCtx filter_ctx;
+    filter_ctx.bitmap_ = bitmap;
+    filter_ctx.reverse_filter_ = reverse_filter;
+    hipvs::SearchOptions options;
+    options.topk_ = topk;
+    options.ef_search_ = ef_search_;
+    options.is_id_excluded_ = bitmap == nullptr ? nullptr : &hipvs_filter_excluded;
+    options.filter_ctx_ = bitmap == nullptr ? nullptr : &filter_ctx;
+    const int64_t total = query_count * topk;
+    try {
+      tl_hipvs_result.ids_.resize(static_cast<size_t>(total));
+      tl_hipvs_result.distances_.resize(static_cast<size_t>(total));
+      tl_hipvs_result.counts_.resize(static_cast<size_t>(query_count));
+    } catch (const std::exception &e) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[HIPVS] allocate search buffers failed", K(ret), "what", e.what());
+    }
+    if (OB_SUCC(ret)) {
+      const int status = hipvs_index_->search(query_vector,
+                                              query_count,
+                                              options,
+                                              tl_hipvs_result.ids_.data(),
+                                              tl_hipvs_result.distances_.data(),
+                                              tl_hipvs_result.counts_.data());
+      if (hipvs::OB_HIPVS_OK != status) {
+        ret = hipvs_status2ob(status);
+        LOG_WARN("[HIPVS] knn search failed", K(ret), KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else {
+        // The bridge lays every query out with a stride of topk, while callers
+        // expect a [query_count, result_size] matrix. Filters can make one
+        // query return fewer rows than another, so use the smallest count and
+        // compact the rows to keep the caller-visible stride consistent.
+        int64_t common = tl_hipvs_result.counts_.at(0);
+        for (int64_t i = 1; i < query_count; ++i) {
+          common = std::min(common, tl_hipvs_result.counts_.at(i));
+        }
+        if (common < topk) {
+          for (int64_t i = 1; i < query_count; ++i) {
+            memmove(tl_hipvs_result.ids_.data() + i * common,
+                    tl_hipvs_result.ids_.data() + i * topk,
+                    static_cast<size_t>(common) * sizeof(int64_t));
+            memmove(tl_hipvs_result.distances_.data() + i * common,
+                    tl_hipvs_result.distances_.data() + i * topk,
+                    static_cast<size_t>(common) * sizeof(float));
+          }
+        }
+        ids = tl_hipvs_result.ids_.data();
+        dist = tl_hipvs_result.distances_.data();
+        result_size = common;
+        if (need_extra_info) {
+          extra_infos = nullptr;
+        }
+      }
+    }
   }
   return ret;
 }
@@ -796,7 +1084,8 @@ int create_index(VectorIndexPtr &index_handler,
                  const char *metric, int dim, int max_degree,
                  int ef_construction, int ef_search, void *allocator,
                  int extra_info_size /* = 0*/, int16_t refine_type /*= 0*/,
-                 int16_t bq_bits_query /*= 32*/, bool bq_use_fht /*= false*/)
+                 int16_t bq_bits_query /*= 32*/, bool bq_use_fht /*= false*/,
+                 bool use_hipvs /*= false*/)
 {
   int ret = OB_SUCCESS;
   if (dtype == nullptr || metric == nullptr) {
@@ -828,7 +1117,7 @@ int create_index(VectorIndexPtr &index_handler,
         HnswIndexHandler *hnsw_index = new HnswIndexHandler(
             true, false, false, dtype, metric, max_degree, ef_construction,
             ef_search, dim, index_type, hnsw, vsag_allocator, extra_info_size,
-            refine_type, bq_bits_query, bq_use_fht);
+            refine_type, bq_bits_query, bq_use_fht, use_hipvs);
         if (OB_ISNULL(hnsw_index)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
         } else {
@@ -1266,6 +1555,194 @@ int knn_search(obvsag::VectorIndexPtr &index_handler, uint32_t len, uint32_t *di
   return ret;
 }
 
+int HnswIndexHandler::serialize_index(std::ostream &out_stream)
+{
+  int ret = OB_SUCCESS;
+  if (!hipvs_capable_) {
+    tl::expected<void, Error> bs = index_->Serialize(out_stream);
+    if (bs.has_value()) {
+      LOG_INFO("[OBVSAG] serialize index success");
+    } else {
+      ret = vsag_errcode2ob(bs.error().type);
+      LOG_WARN("[OBVSAG] fserialize error happend", K(ret), K(bs.error().type));
+    }
+  } else {
+    HipvsSnapshotHeader header;
+    header.version_ = HIPVS_SNAPSHOT_VERSION;
+    header.payload_size_ = 0;
+    const bool use_gpu_payload = use_hipvs_ && hipvs_index_ != nullptr;
+    std::vector<char> payload;
+    if (use_gpu_payload) {
+      header.magic_ = HIPVS_SNAPSHOT_MAGIC;
+      const int status = hipvs_index_->serialize(payload);
+      if (hipvs::OB_HIPVS_OK != status) {
+        ret = hipvs_status2ob(status);
+        LOG_WARN("[HIPVS] serialize gpu index failed", K(ret),
+                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else {
+        header.payload_size_ = static_cast<uint64_t>(payload.size());
+      }
+    } else {
+      header.magic_ = HIPVS_CPU_SNAPSHOT_MAGIC;
+    }
+    if (OB_SUCC(ret)) {
+      out_stream.write(reinterpret_cast<const char *>(&header), sizeof(header));
+      if (!out_stream.good()) {
+        ret = OB_IO_ERROR;
+        LOG_WARN("[HIPVS] write snapshot header failed", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (use_gpu_payload) {
+        if (!payload.empty()) {
+          out_stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        }
+        if (!out_stream.good()) {
+          ret = OB_IO_ERROR;
+          LOG_WARN("[HIPVS] write gpu snapshot payload failed", K(ret));
+        } else {
+          LOG_INFO("[HIPVS] serialize gpu index success", K(payload.size()));
+        }
+      } else {
+        tl::expected<void, Error> bs = index_->Serialize(out_stream);
+        if (bs.has_value()) {
+          LOG_INFO("[OBVSAG] serialize index success with cuvs cpu fallback");
+        } else {
+          ret = vsag_errcode2ob(bs.error().type);
+          LOG_WARN("[OBVSAG] fserialize cpu fallback error", K(ret), K(bs.error().type));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int HnswIndexHandler::deserialize_index(std::istream &in_stream)
+{
+  int ret = OB_SUCCESS;
+  bool use_vsag_payload = true;
+  if (hipvs_capable_) {
+    HipvsSnapshotHeader header;
+    MEMSET(&header, 0, sizeof(header));
+    in_stream.read(reinterpret_cast<char *>(&header), sizeof(header));
+    if (in_stream.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+      ret = OB_IO_ERROR;
+      LOG_WARN("[HIPVS] read snapshot header failed", K(ret), K(in_stream.gcount()));
+    } else if (header.version_ != HIPVS_SNAPSHOT_VERSION) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("[HIPVS] unsupported snapshot version", K(header.version_));
+    } else if (HIPVS_SNAPSHOT_MAGIC == header.magic_) {
+      use_vsag_payload = false;
+      if (!hipvs::ObHipvsIndex::is_available()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("[HIPVS] gpu snapshot requires hipVS, which is unavailable",
+                 KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else if (header.payload_size_ == 0
+                 || header.payload_size_ > static_cast<uint64_t>(INT64_MAX)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("[HIPVS] invalid snapshot payload size", K(header.payload_size_));
+      } else {
+        std::vector<char> payload;
+        try {
+          payload.resize(static_cast<size_t>(header.payload_size_));
+        } catch (const std::exception &e) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("[HIPVS] allocate snapshot buffer failed", K(ret), "what", e.what(),
+                   K(header.payload_size_));
+        }
+        if (OB_SUCC(ret)) {
+          in_stream.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+          if (in_stream.gcount() != static_cast<std::streamsize>(payload.size())) {
+            ret = OB_IO_ERROR;
+            LOG_WARN("[HIPVS] read snapshot payload failed", K(ret), K(in_stream.gcount()));
+          } else {
+            hipvs_index_ = hipvs::ObHipvsIndex::deserialize(
+                payload.data(), static_cast<int64_t>(payload.size()));
+            if (hipvs_index_ == nullptr) {
+              ret = OB_ERR_VSAG_RETURN_ERROR;
+              LOG_WARN("[HIPVS] deserialize gpu snapshot failed",
+                       KCSTRING(hipvs::ObHipvsIndex::last_error()));
+            } else {
+              use_hipvs_ = true;
+              LOG_INFO("[HIPVS] deserialize gpu snapshot success", K(header.payload_size_));
+            }
+          }
+        }
+      }
+    } else if (HIPVS_CPU_SNAPSHOT_MAGIC == header.magic_) {
+      use_vsag_payload = true;
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("[HIPVS] unknown snapshot magic", K(header.magic_));
+    }
+  }
+  if (OB_SUCC(ret) && use_vsag_payload) {
+    use_hipvs_ = false;
+    if (hipvs_index_ != nullptr) {
+      delete hipvs_index_;
+      hipvs_index_ = nullptr;
+    }
+    std::shared_ptr<vsag::Index> hnsw_index;
+    bool use_static = get_use_static();
+    const char *metric = get_metric();
+    const char *dtype = get_dtype();
+    int max_degree = get_max_degree();
+    int ef_construction = get_ef_construction();
+    int ef_search = get_ef_search();
+    int dim = get_dim();
+    int index_type = get_index_type();
+    uint64_t extra_info_size = get_extra_info_size();
+    const char *index_type_str = get_index_type_str(index_type);
+    int16_t refine_type = get_refine_type();
+    int16_t bq_bits_query = get_bq_bits_query();
+    bool bq_use_fht = get_bq_use_fht();
+    bool use_reorder = get_use_reorder();
+    float doc_prune_ratio = get_doc_prune_ratio();
+    int window_size = get_window_size();
+
+    char result_param_str[1024] = {0};
+    if ((IndexType)index_type == IndexType::IPIVF_TYPE) {
+      if (OB_FAIL(construct_vsag_sindi_create_param(uint8_t(index_type),
+              dtype,
+              metric,
+              get_allocator(),
+              extra_info_size,
+              use_reorder,
+              doc_prune_ratio,
+              window_size,
+              result_param_str))) {
+      }
+    } else {
+      if (OB_FAIL(construct_vsag_create_param(
+        uint8_t(index_type), dtype, metric, dim, max_degree,
+        ef_construction, ef_search, get_allocator(),
+        extra_info_size, refine_type, bq_bits_query, bq_use_fht, result_param_str))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else {
+      const std::string input_json_str(result_param_str);
+      tl::expected<std::shared_ptr<Index>, Error> index =
+          vsag::Factory::CreateIndex(index_type_str, input_json_str, get_allocator());
+      if (index.has_value()) {
+        hnsw_index = index.value();
+        tl::expected<void, Error> bs = hnsw_index->Deserialize(in_stream);
+        if (bs.has_value()) {
+          set_index(hnsw_index);
+          LOG_INFO("[OBVSAG] fdeserialize success", KCSTRING(result_param_str));
+        } else {
+          ret = vsag_errcode2ob(bs.error().type);
+          LOG_WARN("[OBVSAG] fdeserialize error", K(ret), K(bs.error().type));
+        }
+      } else {
+        ret = vsag_errcode2ob(index.error().type);
+        LOG_WARN("[OBVSAG] create index error", K(ret), K(index.error().type));
+      }
+    }
+  }
+  return ret;
+}
+
 int fserialize(VectorIndexPtr &index_handler, std::ostream &out_stream)
 {
   int ret = OB_SUCCESS;
@@ -1273,13 +1750,7 @@ int fserialize(VectorIndexPtr &index_handler, std::ostream &out_stream)
     ret = OB_INVALID_ARGUMENT;
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    tl::expected<void, Error> bs = hnsw->get_index()->Serialize(out_stream);
-    if (bs.has_value()) {
-      LOG_INFO("[OBVSAG] serialize index success");
-    } else {
-      ret = vsag_errcode2ob(bs.error().type);
-      LOG_WARN("[OBVSAG] fserialize error happend", K(ret), K(bs.error().type));
-    }
+    ret = hnsw->serialize_index(out_stream);
   }
   return ret;
 }
@@ -1292,62 +1763,7 @@ int fdeserialize(VectorIndexPtr &index_handler,
     ret = OB_INVALID_ARGUMENT;
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    std::shared_ptr<vsag::Index> hnsw_index;
-    bool use_static = hnsw->get_use_static();
-    const char *metric = hnsw->get_metric();
-    const char *dtype = hnsw->get_dtype();
-    int max_degree = hnsw->get_max_degree();
-    int ef_construction = hnsw->get_ef_construction();
-    int ef_search = hnsw->get_ef_search();
-    int dim = hnsw->get_dim();
-    int index_type = hnsw->get_index_type();
-    uint64_t extra_info_size = hnsw->get_extra_info_size();
-    const char* index_type_str = get_index_type_str(index_type);
-    int16_t refine_type = hnsw->get_refine_type();
-    int16_t bq_bits_query = hnsw->get_bq_bits_query();
-    bool bq_use_fht = hnsw->get_bq_use_fht();
-    bool use_reorder = hnsw->get_use_reorder();
-    float doc_prune_ratio = hnsw->get_doc_prune_ratio();
-    int window_size = hnsw->get_window_size();
-
-    char result_param_str[1024] = {0};
-    if ((IndexType)index_type == IndexType::IPIVF_TYPE) {
-      if (OB_FAIL(construct_vsag_sindi_create_param(uint8_t(index_type),
-              dtype,
-              metric,
-              hnsw->get_allocator(),
-              extra_info_size,
-              use_reorder,
-              doc_prune_ratio,
-              window_size,
-              result_param_str))) {
-      }
-    } else {
-      if (OB_FAIL(construct_vsag_create_param(
-        uint8_t(index_type), dtype, metric, dim, max_degree,
-        ef_construction, ef_search, hnsw->get_allocator(),
-        extra_info_size, refine_type, bq_bits_query, bq_use_fht, result_param_str))) {
-      } 
-    }
-    if (OB_FAIL(ret)) {
-    } else {
-      const std::string input_json_str(result_param_str);
-      tl::expected<std::shared_ptr<Index>, Error> index = vsag::Factory::CreateIndex(index_type_str, input_json_str, hnsw->get_allocator());
-      if (index.has_value()) {
-        hnsw_index = index.value();
-        tl::expected<void, Error> bs = hnsw_index->Deserialize(in_stream);
-        if (bs.has_value()) {
-          hnsw->set_index(hnsw_index);
-          LOG_INFO("[OBVSAG] fdeserialize success", KCSTRING(result_param_str));
-        } else {
-          ret = vsag_errcode2ob(bs.error().type);
-          LOG_WARN("[OBVSAG] fdeserialize error", K(ret), K(bs.error().type));
-        }
-      } else {
-        ret = vsag_errcode2ob(index.error().type);
-        LOG_WARN("[OBVSAG] create index error", K(ret), K(index.error().type));
-      }
-    }
+    ret = hnsw->deserialize_index(in_stream);
   }
   return ret;
 }

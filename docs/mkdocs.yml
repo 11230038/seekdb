@@ -40,6 +40,7 @@ nav:
       - Logging: logging.md
       - Memory management: memory.md
       - Containers: container.md
+      - hipVS vector index: hipvs-vector-index.md
   - Contributing: contributing.md
 
 markdown_extensions:

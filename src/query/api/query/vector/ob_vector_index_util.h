@@ -100,6 +100,9 @@ enum ObVectorIndexAlgorithmLib
 {
   VIAL_VSAG = 0,
   VIAL_OB,
+  // GPU accelerated graph construction through AMD hipVS (CAGRA). Falls back
+  // to VIAL_VSAG at runtime when hipVS or a supported GPU is unavailable.
+  VIAL_CUVS,
   VIAL_MAX
 };
 

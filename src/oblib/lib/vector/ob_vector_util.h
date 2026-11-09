@@ -63,7 +63,7 @@ int create_index(obvsag::VectorIndexPtr& index_handler, int index_type,
                  int max_degree, int ef_construction, int ef_search,
                  void* allocator = NULL, int extra_info_size = 0,
                  int16_t refine_type = 0, int16_t bq_bits_query = 32,
-                 bool bq_use_fht = false);
+                 bool bq_use_fht = false, bool use_hipvs = false);
 
 int validate_create_index(const CreateIndexParam &param, std::string &err_msg);
 

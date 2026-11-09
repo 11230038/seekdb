@@ -879,7 +879,8 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                param->extra_info_actual_size_,
                                                param->refine_type_,
                                                param->bq_bits_query_,
-                                               param->bq_use_fht_))) {
+                                               param->bq_use_fht_,
+                                               param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS))) {
         }
       }
 
@@ -936,7 +937,8 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
                                              param->extra_info_actual_size_,
                                              param->refine_type_,
                                              param->bq_bits_query_,
-                                             param->bq_use_fht_))) {
+                                             param->bq_use_fht_,
+                                             param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS))) {
       }
     }
 

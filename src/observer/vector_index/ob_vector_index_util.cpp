@@ -3300,7 +3300,7 @@ int ObVectorIndexUtil::check_index_param(
         if (OB_FAIL(ret)) {
         } else if (lib_is_set && lib_name != "VSAG" && lib_name != "CUVS") {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' or 'CUVS' is");
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' is");
         }
         if (OB_FAIL(ret)) {
         } else if (ef_construction_value <= m_value) {

@@ -33,6 +33,13 @@ option(OB_ENABLE_STANDBY "Build physical standby support" ON)
 option(ENABLE_SANITY "Build with seekdb memory Sanity instrumentation" OFF)
 option(OB_ENABLE_HIPVS "Build the AMD hipVS (GPU) vector index backend" OFF)
 set(HIPVS_ROOT "/opt/hipvs" CACHE PATH "hipVS installation prefix")
+if(OB_ENABLE_HIPVS)
+  # hipVS installs a cuvs package config; make sure a non-system prefix is
+  # searched even when the caller only passes -DHIPVS_ROOT=...
+  if(HIPVS_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${HIPVS_ROOT}")
+  endif()
+endif()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(SEEKDB_GENERATED_ROOT "${CMAKE_BINARY_DIR}/generated")

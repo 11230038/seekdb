@@ -20,7 +20,10 @@ if(OB_ENABLE_HIPVS)
   if(EXISTS "${HIPVS_ROOT}/include")
     target_include_directories(oblib_lib PRIVATE "${HIPVS_ROOT}/include")
   endif()
-  target_compile_definitions(oblib_lib PRIVATE OB_ENABLE_HIPVS=1)
+  # hipVS headers are normally consumed through hipcc, which predefines the
+  # platform macro. The bridge is compiled by the project's clang++ so define it
+  # explicitly; without it <hip/hip_runtime.h> rejects the translation unit.
+  target_compile_definitions(oblib_lib PRIVATE OB_ENABLE_HIPVS=1 __HIP_PLATFORM_AMD__=1)
   target_link_libraries(oblib_lib PUBLIC cuvs::cuvs)
 endif()
 

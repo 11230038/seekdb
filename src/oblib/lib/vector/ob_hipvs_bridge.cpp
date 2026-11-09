@@ -38,6 +38,7 @@
 #include <cuvs/neighbors/cagra.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
+#include <raft/core/host_mdspan.hpp>
 
 #if __has_include(<raft/core/resources.hpp>)
 #include <raft/core/resources.hpp>
@@ -264,33 +265,27 @@ bool ObHipvsIndex::Impl::build_gpu(int device_id)
     if (ok) {
       res_.reset(new detail::RaftResources());
       index_.reset();
-      auto dataset = raft::make_device_matrix<float, int64_t>(*res_, base_count_, dim_);
-      hipError_t err = hipMemcpy(dataset.data_handle(),
-                                 vectors_.data(),
-                                 sizeof(float) * static_cast<size_t>(base_count_) * dim_,
-                                 hipMemcpyHostToDevice);
+      cuvs::neighbors::cagra::index_params params;
+      params.metric = cuvs::distance::DistanceType::L2Expanded;
+      params.graph_degree = static_cast<size_t>(std::max(1, graph_degree_));
+      params.intermediate_graph_degree =
+          static_cast<size_t>(std::max(graph_degree_, intermediate_graph_degree_));
+      // Keep the dataset attached so that the graph is self contained and can
+      // be searched without an external dataset handle.
+      params.attach_dataset_on_build = true;
+      // Hand the host buffer to build(). cuVS copies it to the device and the
+      // returned index owns that copy; passing a device view instead would make
+      // the index keep a non-owning reference to memory owned by this scope.
+      auto built = cuvs::neighbors::cagra::build(
+          *res_, params,
+          raft::make_host_matrix_view<const float, int64_t, raft::row_major>(
+              vectors_.data(), base_count_, dim_));
+      index_.reset(new cuvs::neighbors::cagra::index<float, uint32_t>(std::move(built)));
+      const hipError_t err = hipDeviceSynchronize();
       if (err != hipSuccess) {
-        set_error(std::string("hipMemcpy host->device failed: ") + hipGetErrorString(err));
+        set_error(std::string("hipDeviceSynchronize failed: ") + hipGetErrorString(err));
+        index_.reset();
         ok = false;
-      } else {
-        cuvs::neighbors::cagra::index_params params;
-        params.metric = cuvs::distance::DistanceType::L2Expanded;
-        params.graph_degree = static_cast<size_t>(std::max(1, graph_degree_));
-        params.intermediate_graph_degree =
-            static_cast<size_t>(std::max(graph_degree_, intermediate_graph_degree_));
-        // Keep the dataset attached so that the graph is self contained and can
-        // be searched without an external dataset handle.
-        params.attach_dataset_on_build = true;
-        auto built = cuvs::neighbors::cagra::build(
-            *res_, params, raft::make_device_matrix_view<const float, int64_t>(
-                               dataset.data_handle(), base_count_, dim_));
-        index_.reset(new cuvs::neighbors::cagra::index<float, uint32_t>(std::move(built)));
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-          set_error(std::string("hipDeviceSynchronize failed: ") + hipGetErrorString(err));
-          index_.reset();
-          ok = false;
-        }
       }
     }
   } catch (const std::exception &e) {

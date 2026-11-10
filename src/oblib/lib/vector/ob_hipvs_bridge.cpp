@@ -784,10 +784,14 @@ int ObHipvsIndex::append(const float *vectors, const int64_t *ids, int64_t count
   }
   const int64_t delta_count = static_cast<int64_t>(impl_->delta_ids_.size());
   const int64_t threshold = std::max<int64_t>(kMinFoldDelta, impl_->base_count_);
-  if (delta_count >= threshold && !impl_->fold_delta_and_rebuild()) {
-    // The rows are safely in the delta and the previous graph is still usable,
-    // so the build can continue; searches merge the delta on the host.
-    return OB_HIPVS_GRAPH_FALLBACK;
+  if (delta_count >= threshold) {
+    if (!impl_->fold_delta_and_rebuild()) {
+      // The rows are safely in the delta and the previous graph is still
+      // usable, so the build can continue; searches merge the delta on the
+      // host.
+      return OB_HIPVS_GRAPH_FALLBACK;
+    }
+    return OB_HIPVS_GRAPH_REBUILT;
   }
   return OB_HIPVS_OK;
 }

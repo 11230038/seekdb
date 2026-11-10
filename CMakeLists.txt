@@ -101,13 +101,18 @@ if(OB_HIPVS_ENABLED)
       set(hipvs_archs "")
       foreach(hipvs_agent IN LISTS hipvs_agents)
         string(STRIP "${hipvs_agent}" hipvs_agent)
-        if(hipvs_agent MATCHES "^gfx[0-9a-z]+$")
+        # gfx000 is the host/CPU agent reported by some ROCm releases, not a
+        # compilable GPU target. Passing it to amdclang++ makes configuration
+        # succeed but the first HIP translation unit fail to compile.
+        if(hipvs_agent MATCHES "^gfx[0-9a-z]+$" AND NOT hipvs_agent STREQUAL "gfx000")
           list(APPEND hipvs_archs "${hipvs_agent}")
         endif()
       endforeach()
       if(hipvs_archs)
         list(REMOVE_DUPLICATES hipvs_archs)
-        string(REPLACE ";" " " hipvs_archs "${hipvs_archs}")
+        # CMAKE_HIP_ARCHITECTURES is a CMake list.  Joining multiple gfx
+        # targets with spaces makes CMake pass them to amdclang++ as one
+        # malformed --offload-arch value on multi-GPU build hosts.
         set(CMAKE_HIP_ARCHITECTURES "${hipvs_archs}" CACHE STRING
           "GPU architectures the hipVS bridge is built for")
         message(STATUS "hipVS GPU architectures: ${CMAKE_HIP_ARCHITECTURES}")

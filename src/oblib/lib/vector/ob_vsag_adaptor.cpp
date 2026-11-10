@@ -170,6 +170,7 @@ static int hipvs_status2ob(int status)
   int ret = OB_ERR_VSAG_RETURN_ERROR;
   switch (status) {
     case hipvs::OB_HIPVS_OK:
+    case hipvs::OB_HIPVS_GRAPH_REBUILT:
       ret = OB_SUCCESS;
       break;
     case hipvs::OB_HIPVS_INVALID_ARG:
@@ -497,6 +498,9 @@ int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
       if (hipvs::OB_HIPVS_GRAPH_FALLBACK == status) {
         LOG_WARN("[HIPVS] gpu graph rebuild failed, appended rows stay in the host delta",
                  KCSTRING(hipvs::ObHipvsIndex::last_error()));
+      } else if (hipvs::OB_HIPVS_GRAPH_REBUILT == status) {
+        LOG_INFO("[HIPVS] build index on gpu success",
+                 "count", hipvs_index_->size(), K(dim_), K(max_degree_), K(lbt()));
       } else if (hipvs::OB_HIPVS_OK != status) {
         ret = hipvs_status2ob(status);
         LOG_WARN("[HIPVS] append index failed", K(ret), KCSTRING(hipvs::ObHipvsIndex::last_error()));

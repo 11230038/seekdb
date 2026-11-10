@@ -121,11 +121,13 @@ validate_config() {
 # 生成随机向量数据，每批一个 SQL 文件，供 MySQL 客户端批量导入。
 gen_batches() {
   local out_dir="$1"
-  python3 - "${out_dir}" "${ROWS}" "${DIM}" "${BATCH}" <<'PY'
+  python3 - "${out_dir}" "${ROWS}" "${DIM}" "${BATCH}" "${TABLE}" <<'PY'
 import random
 import sys
 
-out_dir, rows, dim, batch = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+out_dir, rows, dim, batch, table = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+)
 random.seed(20260101)
 
 values = []
@@ -138,7 +140,7 @@ for row_id in range(1, rows + 1):
         path = "%s/load.%05d.sql" % (out_dir, file_no)
         with open(path, "w") as f:
             f.write("SET ob_query_timeout = 100000000000;\n")
-            f.write("INSERT INTO docs (id, v) VALUES " + ",".join(values) + ";\n")
+            f.write("INSERT INTO `%s` (id, v) VALUES " % table + ",".join(values) + ";\n")
         values = []
 print(file_no)
 PY
@@ -193,7 +195,9 @@ build_index_once() {
 }
 
 build_index_samples() {
-  local lib="$1" label="$2" sec_file="${TMP_DIR}/${label}.builds"
+  local lib="$1"
+  local label="$2"
+  local sec_file="${TMP_DIR}/${label}.builds"
   local sample sec_out out_file
   : > "${sec_file}"
   for ((sample = 1; sample <= SAMPLES; sample++)); do
@@ -227,8 +231,11 @@ build_index_samples() {
 load_query_vectors() {
   local q qid vec step
   step=$(( ROWS / QUERIES ))
-  for ((q = 1; q <= QUERIES; q++)); do
-    qid=$(( (q - 1) * step + 1 ))
+  # Keep the arrays zero based because every query/recall loop below iterates
+  # over [0, QUERIES).  The old 1-based fill made the first QVECS[0] access
+  # abort under `set -u` before either backend could be benchmarked.
+  for ((q = 0; q < QUERIES; q++)); do
+    qid=$(( q * step + 1 ))
     vec=$(mysql_exec "SELECT v FROM ${DB}.${TABLE} WHERE id = ${qid};" | tail -1)
     if [[ -z "${vec}" ]]; then
       log "ERROR: cannot read query vector for id=${qid}"

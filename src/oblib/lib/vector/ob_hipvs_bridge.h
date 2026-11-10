@@ -52,6 +52,10 @@ enum ObHipvsStatus
   // rebuilt. The index stays usable: pending vectors are scanned on the host
   // and merged into every search result until a later rebuild succeeds.
   OB_HIPVS_GRAPH_FALLBACK = 6,
+  // append() crossed the fold threshold and successfully rebuilt the CAGRA
+  // graph.  Callers use this status for observability; it is otherwise a
+  // successful append.
+  OB_HIPVS_GRAPH_REBUILT = 7,
   OB_HIPVS_MAX
 };
 
@@ -107,7 +111,8 @@ public:
   // grown past a threshold, so construction really happens on the GPU instead
   // of waiting for a one shot build() that the DDL path never issues.
   // Returns OB_HIPVS_GRAPH_FALLBACK when the rows were accepted but the graph
-  // rebuild failed; queries then merge the delta on the host.
+  // rebuild failed; queries then merge the delta on the host. Returns
+  // OB_HIPVS_GRAPH_REBUILT when the append successfully rebuilt the graph.
   int append(const float *vectors, const int64_t *ids, int64_t count);
 
   // Folds the pending delta into the base and rebuilds the GPU graph. Called

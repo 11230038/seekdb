@@ -288,10 +288,9 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
   int ret = OB_SUCCESS;
   static int64_t FT_WORD_DOC_COL_CNT = 4;
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
-  // UTF-8 text can yield substantially more tokens than byte_length / 10.
-  // Keep the load factor low because every token probes this map, and grow a
-  // reused map when a later document is larger than the first one.
-  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 2, 2), FT_MAX_WORD_BUCKET);
+  // Keep enough buckets for typical words without making every document scan
+  // a mostly empty map. Grow the reused map if a later document is larger.
+  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
   ObFTWordMap local_word_map;
   ObFTWordMap &ft_word_map = OB_ISNULL(word_map) ? local_word_map : *word_map;

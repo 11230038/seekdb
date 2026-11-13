@@ -26,7 +26,6 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
-    integer_id_(false),
     is_inited_(false)
 {
 }
@@ -40,7 +39,6 @@ int ObSRMergeCmp::init(
     ret = OB_ERR_UNEXPECTED;
   } else {
     iter_ids_ = iter_ids;
-    integer_id_ = id_meta.type_ == common::ObUInt64Type;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -60,12 +58,6 @@ int ObSRMergeCmp::cmp(
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (integer_id_
-      && !get_id_datum(l.iter_idx_).is_null()
-      && !get_id_datum(r.iter_idx_).is_null()) {
-    const uint64_t left_id = get_id_datum(l.iter_idx_).get_uint64();
-    const uint64_t right_id = get_id_datum(r.iter_idx_).get_uint64();
-    cmp_ret = left_id < right_id ? -1 : (left_id > right_id ? 1 : 0);
   } else {
     int tmp_ret = 0;
     if (OB_FAIL(cmp_func_(
@@ -90,7 +82,6 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
-    skip_relevance_collection_(false),
     set_datum_func_(nullptr)
 {
 }
@@ -111,9 +102,6 @@ int ObSRDaaTIterImpl::init(
     iter_param_ = &iter_param;
     dim_iters_ = &dim_iters;
     relevance_collector_ = &relevance_collector;
-    skip_relevance_collection_ = !iter_param.need_calc_relevance()
-        && !iter_param.need_filter()
-        && relevance_collector.any_match_is_valid();
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
@@ -168,7 +156,6 @@ void ObSRDaaTIterImpl::reset()
   buffered_relevances_.reset();
   next_round_iter_idxes_.reset();
   next_round_cnt_ = 0;
-  skip_relevance_collection_ = false;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   is_inited_ = false;
@@ -299,10 +286,8 @@ int ObSRDaaTIterImpl::fill_merge_heap()
       } else {
         ret = OB_SUCCESS;
       }
-    } else if (!skip_relevance_collection_ && OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
-    } else if (!skip_relevance_collection_ && OB_NOT_NULL(iter_param_->dim_weights_)
-        && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_
-            * iter_param_->dim_weights_->at(iter_idx))) {
+    } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+    } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
     } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
     } else if (OB_FAIL(merge_heap_->push(item))) {
@@ -336,8 +321,7 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
       curr_doc_end = true;
     }
     if (OB_FAIL(merge_heap_->top(top_item))) {
-    } else if (!skip_relevance_collection_
-        && OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
+    } else if (OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
     } else if (OB_FAIL(merge_heap_->pop())) {
     } else {
@@ -349,8 +333,6 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
     id_datum = iter_domain_ids_[iter_idx];
     if (OB_ISNULL(id_datum)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (skip_relevance_collection_) {
-      got_valid_id = true;
     } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
     } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
     }
@@ -415,9 +397,7 @@ int ObSRDaaTIterImpl::cache_result(int64_t &count, const ObDatum &id_datum, cons
     ret = OB_INVALID_ARGUMENT;
   } else {
     buffered_domain_ids_[count].from_datum(id_datum);
-    if (iter_param_->need_project_relevance()) {
-      buffered_relevances_[count] = relevance;
-    }
+    buffered_relevances_[count] = relevance;
     ++count;
     ++output_row_cnt_;
     if (limit_param->is_valid() && output_row_cnt_ >= limit) {
@@ -461,11 +441,9 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
     set_datum_func_(id_proj_datum, buffered_domain_ids_[0]);
     id_proj_expr->set_evaluated_projected(*eval_ctx);
-    if (iter_param_->need_project_relevance()) {
-      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-      relevance_proj_datum.set_double(buffered_relevances_[0]);
-      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
-    }
+    ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+    relevance_proj_datum.set_double(buffered_relevances_[0]);
+    relevance_proj_expr->set_evaluated_projected(*eval_ctx);
   }
   return ret;
 }

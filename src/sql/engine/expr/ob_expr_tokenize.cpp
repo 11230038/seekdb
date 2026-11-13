@@ -82,7 +82,7 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 {
   int ret = OB_SUCCESS;
   storage::ObFTParseHelper tokenize_helper;
-  const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 4, 2), 997);
+  const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
   storage::ObFTWordMap token_map;
 
@@ -214,26 +214,9 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
-  const char *builtin_inner_name = nullptr;
-  static_assert(storage::ObFTParser::BUILTIN_VERSION == 1,
-      "TOKENIZE built-in parser names must track ObFTParser::BUILTIN_VERSION");
 
   char *parser_name_buf = nullptr;
-  if (0 == input_str.case_compare(storage::ObFTSLiteral::PARSER_NAME_IK)) {
-    builtin_inner_name = "ik.1";
-  } else if (0 == input_str.case_compare(storage::ObFTSLiteral::PARSER_NAME_BENG)) {
-    builtin_inner_name = "beng.1";
-  } else if (0 == input_str.case_compare(storage::ObFTSLiteral::PARSER_NAME_SPACE)) {
-    builtin_inner_name = "space.1";
-  } else if (0 == input_str.case_compare(storage::ObFTSLiteral::PARSER_NAME_NGRAM)) {
-    builtin_inner_name = "ngram.1";
-  } else if (0 == input_str.case_compare(storage::ObFTSLiteral::PARSER_NAME_NGRAM2)) {
-    builtin_inner_name = "ngram2.1";
-  }
-
-  if (OB_NOT_NULL(builtin_inner_name)) {
-    param.parser_name_ = ObString::make_string(builtin_inner_name);
-  } else if (OB_ISNULL(parser_name_buf
+  if (OB_ISNULL(parser_name_buf
                 = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(parser.init(input_str))) {
